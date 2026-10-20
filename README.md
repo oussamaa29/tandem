@@ -26,7 +26,8 @@ Un CRUD affiche des données ; une app collaborative doit les garder **cohérent
 | Backend | FastAPI, WebSockets, SQLAlchemy 2, migrations Alembic |
 | Base de données | SQLite par défaut (zéro installation), PostgreSQL (psycopg 3) via `DATABASE_URL` |
 | Auth | bcrypt (sur un condensé SHA-256, pour les mots de passe de plus de 72 octets) + JWT (en en-tête pour REST ; pour le WebSocket, en premier message après l'ouverture, jamais dans l'URL qui finirait dans les journaux d'accès) |
-| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées et la vérification des migrations (48 tests), exécutés en CI sur SQLite **et** PostgreSQL 16 |
+| Temps réel multi-instances | Redis (pub/sub + présence partagée), optionnel via `REDIS_URL` |
+| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées, plusieurs instances reliées par Redis et la vérification des migrations (56 tests), exécutés en CI sur SQLite, PostgreSQL 16 **et** Redis 7 |
 
 Aucun service payant.
 
@@ -82,9 +83,10 @@ Ouvre http://localhost:5176 dans **deux navigateurs différents** (ou une fenêt
 cd backend
 pytest                                   # SQLite temporaire, aucune installation
 TEST_DATABASE_URL=postgresql://user:pass@localhost:5432/tandem_test pytest   # sur Postgres (base vidée !)
+TEST_REDIS_URL=redis://localhost:6379/0 REDIS_URL=redis://localhost:6379/0 pytest   # hub sur un vrai Redis
 ```
 
-Les tests créent le schéma avec les migrations Alembic (pas `create_all`) et vérifient qu'il correspond exactement aux modèles. La CI exécute la suite sur SQLite et sur un service PostgreSQL 16.
+Les tests créent le schéma avec les migrations Alembic (pas `create_all`) et vérifient qu'il correspond exactement aux modèles. Les tests multi-instances (`test_hub_redis.py`) utilisent fakeredis en mémoire, ou un vrai Redis avec `TEST_REDIS_URL`. La CI exécute la suite sur SQLite, sur un service PostgreSQL 16, et sur un service Redis 7 (toute la suite en mode distribué).
 
 ## Architecture du temps réel
 
@@ -99,7 +101,36 @@ Les tests créent le schéma avec les migrations Alembic (pas `create_all`) et v
 
 - **Écritures en REST, lecture en WebSocket** : chaque modification est validée et transactionnelle, puis diffusée. Le WebSocket ne transporte vers le serveur que l'authentification (`{ type: "auth", token }`, premier message, 5 s maximum) et des signaux éphémères (présence, « je modifie la carte 12 »).
 - **Événements idempotents** côté client : appliquer deux fois le même événement, ou recevoir l'écho de sa propre action, ne change rien.
-- **Mise à l'échelle** : le hub de diffusion est en mémoire (un seul processus). Pour plusieurs instances, `hub.publish` passerait par un pub/sub (Redis, ou `LISTEN/NOTIFY` de Postgres) sans changer le reste du code.
+- **Mise à l'échelle** : sans `REDIS_URL`, le hub est en mémoire (un seul processus, idéal en local). Avec `REDIS_URL`, plusieurs instances se partagent le temps réel (voir ci-dessous) ; `main.py` n'en sait rien, l'interface du hub est la même.
+
+### Plusieurs instances (Redis)
+
+```
+            ┌──────────── répartiteur de charge (WebSocket activé) ────────────┐
+            ▼                                                                  ▼
+   instance A (uvicorn)                                              instance B (uvicorn)
+   connexions WS locales  ──PUBLISH tandem:board:12──▶  Redis  ──▶  abonnée à tandem:board:*
+   présence de A ─HSET tandem:presence:12 A─▶ (hash par tableau)  ◀─HSET … B─ présence de B
+```
+
+```bash
+# même base Postgres et même JWT_SECRET pour toutes les instances
+REDIS_URL=redis://redis:6379/0 uvicorn main:app --port 8041
+REDIS_URL=redis://redis:6379/0 uvicorn main:app --port 8042   # ou --workers N : chaque processus est une instance
+```
+
+Aucune affinité de session (« sticky sessions ») n'est nécessaire : REST et WebSocket d'un même utilisateur peuvent arriver sur des instances différentes.
+
+| | Portée |
+|---|---|
+| Événements (`card.moved`…), retrait d'un membre (fermeture 4403), suppression du tableau (4404) | **Globale** : publiés sur `tandem:board:<id>`, chaque instance les remet à ses connexions. L'instance qui publie reçoit son propre message par l'abonnement, comme les autres (pas de double envoi), et l'ordre des événements d'un même émetteur est conservé |
+| Présence et « Sarah modifie… » | **Globale** : chaque instance écrit ses utilisateurs dans `tandem:presence:<id>` (un champ par instance) ; toute modification déclenche la diffusion de la liste fusionnée, dédoublonnée par utilisateur (plusieurs onglets ou instances) |
+| Connexions WebSocket, verrou d'envoi par connexion | **Locale** à l'instance |
+
+Pannes :
+
+- **Instance arrêtée brutalement** : sa clé de vie (TTL 15 s, rafraîchie toutes les 5 s) expire ; une autre instance la retire alors de la présence et diffuse la liste à jour. Un arrêt normal la retire immédiatement.
+- **Redis indisponible** : l'erreur est journalisée, chaque instance continue de servir ses propres connexions (diffusion locale uniquement) et l'abonnement se reconnecte avec un délai exponentiel (0,5 s → 10 s). Les événements perdus entre instances pendant la coupure sont rattrapés par les clients, qui détectent le trou dans les révisions et rechargent le tableau.
 
 ## Accessibilité & UX
 
@@ -114,7 +145,7 @@ Les tests créent le schéma avec les migrations Alembic (pas `create_all`) et v
 tandem/
 ├── backend/
 │   ├── main.py        # Routes REST + endpoint WebSocket
-│   ├── hub.py         # Rooms, présence, diffusion
+│   ├── hub.py         # Rooms, présence, diffusion (en mémoire, ou entre instances via Redis)
 │   ├── positions.py   # Indexation fractionnaire + rééquilibrage
 │   ├── models.py      # User, Board, Membership, BoardColumn, Card, Activity
 │   ├── database.py    # Moteur SQLite / Postgres, pool, application des migrations
