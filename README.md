@@ -1,5 +1,7 @@
 # Tandem — Kanban collaboratif en temps réel
 
+[![CI](https://github.com/oussamaa29/tandem/actions/workflows/ci.yml/badge.svg)](https://github.com/oussamaa29/tandem/actions/workflows/ci.yml)
+
 Tableaux Kanban partagés : quand un membre déplace une carte, la renomme ou l'assigne, tous les autres le voient **instantanément**, sans recharger. Présence en direct, indicateur « Sarah modifie… », historique d'activité, et gestion explicite des conflits d'édition.
 
 ## Pourquoi ce projet
