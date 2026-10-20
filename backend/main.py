@@ -34,7 +34,12 @@ async def lifespan(_app: FastAPI):
     # production doit être une étape explicite du déploiement, pas un effet de bord du démarrage.
     if is_sqlite:
         await run_in_threadpool(upgrade_schema)
-    yield
+    # Avec REDIS_URL : abonnement aux autres instances et battement de présence ; sinon rien
+    await hub.start()
+    try:
+        yield
+    finally:
+        await hub.stop()
 
 
 app = FastAPI(title="Tandem — Kanban collaboratif en temps réel", version="1.0.0", lifespan=lifespan)
