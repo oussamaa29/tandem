@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -10,6 +10,11 @@ MEMBER = "member"
 
 # Couleurs d'avatar attribuées à l'inscription (lisibles en clair comme en sombre)
 AVATAR_COLORS = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6", "#14b8a6"]
+
+
+def next_avatar_color(db) -> str:
+    """Couleurs attribuées à tour de rôle, selon le nombre de comptes existants."""
+    return AVATAR_COLORS[db.query(func.count(User.id)).scalar() % len(AVATAR_COLORS)]
 
 
 # Dates en UTC sans fuseau (DATETIME en SQLite, TIMESTAMP WITHOUT TIME ZONE en Postgres) : même
@@ -25,9 +30,40 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
     name = Column(String(80), nullable=False)
-    password_hash = Column(String(255), nullable=False)
+    # NULL pour un compte créé via Google ou GitHub (pas de connexion par mot de passe possible)
+    password_hash = Column(String(255), nullable=True)
     color = Column(String(9), nullable=False)
     created_at = Column(DateTime, default=_utcnow)
+
+
+class OAuthAccount(Base):
+    """Identité chez un fournisseur (Google, GitHub) rattachée à un compte. Un compte peut en avoir
+    plusieurs ; une identité (fournisseur, identifiant chez lui) n'appartient qu'à un compte."""
+
+    __tablename__ = "oauth_accounts"
+    __table_args__ = (UniqueConstraint("provider", "subject"),)
+
+    id = Column(Integer, primary_key=True)
+    provider = Column(String(20), nullable=False)
+    # Identifiant stable chez le fournisseur (`sub` Google, `id` GitHub) : l'e-mail peut changer
+    subject = Column(String(255), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+    user = relationship("User")
+
+
+class LoginCode(Base):
+    """Code de connexion à usage unique et de courte durée, remis au frontend dans l'URL de retour
+    OAuth à la place du jeton de session. En base (et non en mémoire) : l'échange peut arriver
+    sur une autre instance que le retour OAuth. Seul son condensé est stocké."""
+
+    __tablename__ = "login_codes"
+
+    id = Column(Integer, primary_key=True)
+    code_hash = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    expires_at = Column(DateTime, nullable=False)
 
 
 class Board(Base):

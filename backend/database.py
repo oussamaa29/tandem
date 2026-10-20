@@ -77,24 +77,22 @@ def _rebuild_legacy_sqlite_tables() -> None:
     l'identique avec les noms de NAMING_CONVENTION, données copiées, pour que les migrations
     suivantes (et l'autogénération) voient exactement le schéma de la migration initiale.
 
+    La table recréée vient de la réflexion de la base (et non des modèles, qui peuvent déjà être
+    en avance sur la migration initiale) : seuls les noms de contraintes changent.
+
     Moteur dédié sans PRAGMA foreign_keys=ON : la recréation copie la table puis supprime
     l'ancienne, ce qui déclencherait sinon les ON DELETE CASCADE des tables filles."""
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
     from sqlalchemy.pool import NullPool
 
-    import models  # noqa: F401  (enregistre les tables dans Base.metadata)
-
     rebuild_engine = create_engine(DATABASE_URL, poolclass=NullPool)
     try:
         with rebuild_engine.begin() as conn:
             op = Operations(MigrationContext.configure(conn))
-            for table in Base.metadata.sorted_tables:
-                with op.batch_alter_table(table.name, recreate="always", copy_from=table):
+            for name in inspect(conn).get_table_names():
+                with op.batch_alter_table(name, recreate="always", naming_convention=NAMING_CONVENTION):
                     pass
-                # Avec copy_from, Alembic ne recrée pas les index de l'ancienne table
-                for index in table.indexes:
-                    index.create(conn, checkfirst=True)
     finally:
         rebuild_engine.dispose()
     # Les connexions déjà ouvertes gardent l'ancien schéma en cache pour les PRAGMA
