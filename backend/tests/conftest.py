@@ -5,20 +5,48 @@ from pathlib import Path
 
 import pytest
 
-_db_dir = tempfile.mkdtemp()
-os.environ["DATABASE_URL"] = f"sqlite:///{_db_dir}/test.db"
+# Postgres en CI (TEST_DATABASE_URL), sinon un fichier SQLite temporaire : aucune installation requise
+if os.environ.get("TEST_DATABASE_URL"):
+    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+else:
+    _db_dir = tempfile.mkdtemp()
+    os.environ["DATABASE_URL"] = f"sqlite:///{_db_dir}/test.db"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
-from database import Base, engine  # noqa: E402
+from database import Base, engine, is_sqlite, upgrade_schema  # noqa: E402
 from main import app  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def fresh_db():
+def drop_schema():
+    """Supprime toutes les tables, y compris celle des versions d'Alembic."""
     Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def schema():
+    # Les tests tournent sur le schéma produit par les migrations, pas par create_all. Une base
+    # Postgres réutilisée peut contenir le schéma d'une exécution précédente : on repart de zéro.
+    drop_schema()
+    upgrade_schema()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def fresh_db(schema):
+    # Vider plutôt que recréer : rapide, et identique sur les deux bases (identifiants repartant à 1)
+    with engine.begin() as conn:
+        if is_sqlite:
+            for table in reversed(Base.metadata.sorted_tables):
+                conn.execute(table.delete())
+        else:
+            quote = engine.dialect.identifier_preparer.quote
+            tables = ", ".join(quote(t.name) for t in Base.metadata.sorted_tables)
+            conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
     yield
 
 
