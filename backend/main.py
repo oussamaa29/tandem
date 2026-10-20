@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from typing import Callable
 
 import anyio
@@ -6,13 +7,14 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Web
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 import models
 import schemas
 from auth import create_token, get_current_user, hash_password, user_from_token, verify_password
 from config import check_secret, settings
-from database import Base, SessionLocal, engine, get_db
+from database import SessionLocal, get_db, is_sqlite, is_unique_violation, upgrade_schema
 from hub import hub
 from positions import evenly_spaced, position_at
 
@@ -23,9 +25,19 @@ check_secret(settings)
 # Délai laissé au client pour s'authentifier après l'ouverture du WebSocket
 WS_AUTH_TIMEOUT = 5.0
 
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Tandem — Kanban collaboratif en temps réel", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Le schéma est géré par Alembic (`alembic upgrade head`). En SQLite (développement local, une
+    # seule instance), on l'applique au démarrage pour garder un lancement sans étape préalable.
+    # Jamais en Postgres : plusieurs instances migreraient en même temps, et une migration de
+    # production doit être une étape explicite du déploiement, pas un effet de bord du démarrage.
+    if is_sqlite:
+        await run_in_threadpool(upgrade_schema)
+    yield
+
+
+app = FastAPI(title="Tandem — Kanban collaboratif en temps réel", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -106,6 +118,25 @@ def card_for(db: Session, user: models.User, card_id: int) -> tuple[models.Card,
     return card, db.get(models.Board, card.board_id)
 
 
+def lock_board(db: Session, board_id: int) -> None:
+    """Verrouille la ligne du tableau (SELECT … FOR NO KEY UPDATE) : à appeler par chaque route
+    d'écriture après le contrôle d'accès, AVANT sa première écriture.
+
+    En Postgres, les écritures d'un même tableau prennent ainsi toutes leurs verrous dans le même
+    ordre (tableau, puis cartes / colonnes / membres). Sans cela, une route verrouillait d'abord sa
+    carte puis le tableau (dans emit), tandis que la suppression du tableau verrouillait le tableau
+    puis, par ON DELETE CASCADE, les cartes : interblocage, et l'une des deux finissait en 500.
+    NO KEY UPDATE (le verrou que prend déjà UPDATE boards SET revision) exclut les autres écritures
+    et la suppression du tableau, sans bloquer les simples vérifications de clé étrangère.
+    Si le tableau a été supprimé pendant l'attente, 404. Sans effet en SQLite, qui sérialise de
+    toute façon les écritures sur la base entière."""
+    locked = db.execute(
+        select(models.Board.id).where(models.Board.id == board_id).with_for_update(key_share=True)
+    ).first()
+    if locked is None:
+        raise HTTPException(404, "Tableau introuvable")
+
+
 # ---------------- Diffusion ----------------
 
 def emit(
@@ -119,17 +150,24 @@ def emit(
 ) -> dict:
     """Incrémente la révision du tableau, journalise, commit, puis diffuse après la réponse.
 
-    L'incrément est fait en SQL (revision = revision + 1) pour rester correct si deux requêtes
-    modifient le même tableau en même temps. La révision permet aux clients de détecter un
-    événement manqué et de se resynchroniser.
+    L'incrément est fait en SQL (revision = revision + 1 … RETURNING revision, une seule requête
+    sur SQLite comme sur Postgres) pour rester correct si deux requêtes modifient le même tableau
+    en même temps. En Postgres, la route appelante tient déjà le verrou de la ligne du tableau
+    (lock_board, pris avant sa première écriture) jusqu'à ce commit : les écritures d'un tableau
+    sont donc sérialisées et chacune lit la révision suivante. La révision permet aux clients de
+    détecter un événement manqué et de se resynchroniser.
 
     Le contenu de l'événement est construit AVANT le commit, dans la transaction : après le
     commit, lire les objets forcerait un rechargement, qui échouerait si une requête concurrente
     venait de supprimer la ligne (écriture validée mais erreur 500 et aucune diffusion).
     Retourne ce contenu, que la route peut renvoyer tel quel.
     """
-    db.execute(update(models.Board).where(models.Board.id == board.id).values(revision=models.Board.revision + 1))
-    revision = db.execute(select(models.Board.revision).where(models.Board.id == board.id)).scalar_one()
+    revision = db.execute(
+        update(models.Board)
+        .where(models.Board.id == board.id)
+        .values(revision=models.Board.revision + 1)
+        .returning(models.Board.revision)
+    ).scalar_one()
     activity = None
     if message:
         activity = models.Activity(board_id=board.id, user_id=actor.id, message=message)
@@ -158,7 +196,14 @@ def register(payload: schemas.RegisterIn, db: Session = Depends(get_db)):
         color=models.AVATAR_COLORS[count % len(models.AVATAR_COLORS)],
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        # Deux inscriptions simultanées avec le même e-mail : l'index unique tranche
+        if is_unique_violation(exc):
+            raise HTTPException(409, "Un compte existe déjà avec cet e-mail")
+        raise
     db.refresh(user)
     return {"token": create_token(user.id), "user": user_out(user)}
 
@@ -200,18 +245,23 @@ def list_boards(user: models.User = Depends(get_current_user), db: Session = Dep
         db.query(models.Membership)
         .options(selectinload(models.Membership.user))
         .filter(models.Membership.board_id.in_(board_ids))
+        .order_by(models.Membership.id)  # sans ORDER BY, Postgres ne garantit aucun ordre
     ):
         members.setdefault(m.board_id, []).append(member_out(m))
 
-    out = [
+    # Tri sur la date elle-même (et non sa chaîne ISO), départagé par id : ordre stable quel que
+    # soit l'ordre de lecture des lignes
+    rows = sorted(
+        ((m, b) for m in memberships if (b := boards.get(m.board_id))),
+        key=lambda mb: (mb[1].created_at, mb[1].id), reverse=True,
+    )
+    return [
         {
             "id": b.id, "name": b.name, "role": m.role, "created_at": b.created_at.isoformat(),
             "card_count": card_counts.get(b.id, 0), "members": members.get(b.id, []),
         }
-        for m in memberships
-        if (b := boards.get(m.board_id))
+        for m, b in rows
     ]
-    return sorted(out, key=lambda b: b["created_at"], reverse=True)
 
 
 @app.post("/api/boards", status_code=201)
@@ -254,6 +304,7 @@ def rename_board(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     board = board_for(db, user, board_id)
+    lock_board(db, board.id)
     if board.name == payload.name:
         return {"id": board.id, "name": board.name}
     board.name = payload.name
@@ -268,6 +319,8 @@ def delete_board(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     board = board_for(db, user, board_id, owner_only=True)
+    # Attend la fin des écritures en cours sur ce tableau avant de le supprimer en cascade
+    lock_board(db, board.id)
     db.delete(board)
     db.commit()
     background.add_task(hub.publish, board_id, {"type": "board.deleted", "actor_id": user.id, "payload": {}})
@@ -300,14 +353,27 @@ def add_member(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     board = board_for(db, user, board_id, owner_only=True)
+    lock_board(db, board.id)
     invitee = db.query(models.User).filter_by(email=payload.email.lower()).first()
     if not invitee:
         raise HTTPException(404, "Aucun compte avec cet e-mail : la personne doit d'abord s'inscrire")
     if _membership(db, board.id, invitee.id):
         raise HTTPException(409, f"{invitee.name} fait déjà partie du tableau")
+    invitee_name = invitee.name
     membership = models.Membership(board_id=board.id, user_id=invitee.id, role=models.MEMBER)
     db.add(membership)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        # Invitation simultanée de la même personne : la contrainte unique (board_id, user_id) tranche
+        if is_unique_violation(exc):
+            raise HTTPException(409, f"{invitee_name} fait déjà partie du tableau")
+        # Clé étrangère : le tableau a été supprimé entre-temps (possible en SQLite, où lock_board
+        # ne verrouille rien)
+        if db.get(models.Board, board_id) is None:
+            raise HTTPException(404, "Tableau introuvable")
+        raise
     return emit(db, background, board, user, "member.added", lambda: member_out(membership), f"a invité {invitee.name}")
 
 
@@ -318,6 +384,7 @@ def remove_member(
 ):
     leaving_self = member_id == user.id
     board = board_for(db, user, board_id, owner_only=not leaving_self)
+    lock_board(db, board.id)
     membership = _membership(db, board.id, member_id)
     if not membership:
         raise HTTPException(404, "Membre introuvable")
@@ -338,7 +405,8 @@ def remove_member(
             .execution_options(synchronize_session=False)
         )
     unassigned = db.scalars(
-        select(models.Card).where(models.Card.id.in_(ids)).execution_options(populate_existing=True)
+        select(models.Card).where(models.Card.id.in_(ids)).order_by(models.Card.id)
+        .execution_options(populate_existing=True)
     ).all()
     message = "a quitté le tableau" if leaving_self else f"a retiré {name} du tableau"
     emit(db, background, board, user, "member.removed",
@@ -355,6 +423,7 @@ def create_column(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     board = board_for(db, user, board_id)
+    lock_board(db, board.id)
     last = db.query(func.max(models.BoardColumn.position)).filter_by(board_id=board.id).scalar()
     col = models.BoardColumn(board_id=board.id, name=payload.name, position=(last or 0) + 1024)
     db.add(col)
@@ -369,6 +438,7 @@ def rename_column(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     col, board = column_for(db, user, column_id)
+    lock_board(db, board.id)
     old = col.name
     if old == payload.name:
         return column_out(col, with_cards=False)
@@ -383,6 +453,7 @@ def move_column(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     col, board = column_for(db, user, column_id)
+    lock_board(db, board.id)
     others = (
         db.query(models.BoardColumn)
         .filter(models.BoardColumn.board_id == board.id, models.BoardColumn.id != col.id)
@@ -408,6 +479,7 @@ def delete_column(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     col, board = column_for(db, user, column_id)
+    lock_board(db, board.id)
     name = col.name
     db.delete(col)
     db.flush()
@@ -424,6 +496,7 @@ def create_card(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     col, board = column_for(db, user, column_id)
+    lock_board(db, board.id)
     last = db.query(func.max(models.Card.position)).filter_by(column_id=col.id).scalar()
     card = models.Card(
         board_id=board.id, column_id=col.id, title=payload.title,
@@ -446,6 +519,7 @@ def update_card(
     on refuse (409) en renvoyant la version à jour plutôt que d'écraser silencieusement son travail.
     """
     card, board = card_for(db, user, card_id)
+    lock_board(db, board.id)
     if payload.version != card.version:
         raise HTTPException(409, {"message": "La carte a été modifiée entre-temps", "card": card_out(card)})
 
@@ -495,6 +569,7 @@ def move_card(
     """Déplace une carte à `index` dans la colonne cible. Le serveur calcule la position :
     le client ne fournit qu'une intention, jamais une valeur de tri brute."""
     card, board = card_for(db, user, card_id)
+    lock_board(db, board.id)
     target = db.get(models.BoardColumn, payload.column_id)
     if not target or target.board_id != board.id:
         raise HTTPException(404, "Colonne introuvable")
@@ -533,6 +608,7 @@ def delete_card(
     user: models.User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
     card, board = card_for(db, user, card_id)
+    lock_board(db, board.id)
     title = card.title
     db.delete(card)
     db.flush()
