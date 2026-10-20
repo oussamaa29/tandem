@@ -23,6 +23,11 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ExchangeIn(BaseModel):
+    """Code de connexion à usage unique reçu au retour de Google / GitHub."""
+    code: str = Field(min_length=1, max_length=200)
+
+
 class BoardIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 

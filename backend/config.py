@@ -20,6 +20,15 @@ class Settings:
     CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:5176").split(",")
     # Diffusion entre plusieurs instances (pub/sub + présence partagée) ; absent : tout en mémoire
     REDIS_URL: str | None = os.getenv("REDIS_URL") or None
+    # Adresses publiques : retour OAuth ({PUBLIC_API_URL}/api/auth/<fournisseur>/callback) et
+    # redirection finale vers l'application
+    PUBLIC_API_URL: str = os.getenv("PUBLIC_API_URL", "http://localhost:8040").rstrip("/")
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5176").rstrip("/")
+    # « Continuer avec Google / GitHub » : actif seulement si identifiant ET secret sont définis
+    GOOGLE_CLIENT_ID: str = os.getenv("GOOGLE_CLIENT_ID", "")
+    GOOGLE_CLIENT_SECRET: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    GITHUB_CLIENT_ID: str = os.getenv("GITHUB_CLIENT_ID", "")
+    GITHUB_CLIENT_SECRET: str = os.getenv("GITHUB_CLIENT_SECRET", "")
 
 
 def check_secret(s: "Settings") -> None:
