@@ -12,6 +12,9 @@ MEMBER = "member"
 AVATAR_COLORS = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#8b5cf6", "#14b8a6"]
 
 
+# Dates en UTC sans fuseau (DATETIME en SQLite, TIMESTAMP WITHOUT TIME ZONE en Postgres) : même
+# valeur et même format ISO renvoyé quelle que soit la base ou le fuseau de la session Postgres ;
+# le client sait qu'elles sont en UTC (format.ts ajoute le « Z »)
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 

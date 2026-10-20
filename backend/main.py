@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 from typing import Callable
 
 import anyio
@@ -6,13 +7,14 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Web
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 import models
 import schemas
 from auth import create_token, get_current_user, hash_password, user_from_token, verify_password
 from config import check_secret, settings
-from database import Base, SessionLocal, engine, get_db
+from database import SessionLocal, get_db, is_sqlite, upgrade_schema
 from hub import hub
 from positions import evenly_spaced, position_at
 
@@ -23,9 +25,19 @@ check_secret(settings)
 # Délai laissé au client pour s'authentifier après l'ouverture du WebSocket
 WS_AUTH_TIMEOUT = 5.0
 
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Tandem — Kanban collaboratif en temps réel", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Le schéma est géré par Alembic (`alembic upgrade head`). En SQLite (développement local, une
+    # seule instance), on l'applique au démarrage pour garder un lancement sans étape préalable.
+    # Jamais en Postgres : plusieurs instances migreraient en même temps, et une migration de
+    # production doit être une étape explicite du déploiement, pas un effet de bord du démarrage.
+    if is_sqlite:
+        await run_in_threadpool(upgrade_schema)
+    yield
+
+
+app = FastAPI(title="Tandem — Kanban collaboratif en temps réel", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,8 +131,10 @@ def emit(
 ) -> dict:
     """Incrémente la révision du tableau, journalise, commit, puis diffuse après la réponse.
 
-    L'incrément est fait en SQL (revision = revision + 1) pour rester correct si deux requêtes
-    modifient le même tableau en même temps. La révision permet aux clients de détecter un
+    L'incrément est fait en SQL (revision = revision + 1 … RETURNING revision, une seule requête
+    sur SQLite comme sur Postgres) pour rester correct si deux requêtes modifient le même tableau
+    en même temps : en Postgres, la ligne du tableau reste verrouillée jusqu'au commit, la seconde
+    requête attend et lit la révision suivante. La révision permet aux clients de détecter un
     événement manqué et de se resynchroniser.
 
     Le contenu de l'événement est construit AVANT le commit, dans la transaction : après le
@@ -128,8 +142,12 @@ def emit(
     venait de supprimer la ligne (écriture validée mais erreur 500 et aucune diffusion).
     Retourne ce contenu, que la route peut renvoyer tel quel.
     """
-    db.execute(update(models.Board).where(models.Board.id == board.id).values(revision=models.Board.revision + 1))
-    revision = db.execute(select(models.Board.revision).where(models.Board.id == board.id)).scalar_one()
+    revision = db.execute(
+        update(models.Board)
+        .where(models.Board.id == board.id)
+        .values(revision=models.Board.revision + 1)
+        .returning(models.Board.revision)
+    ).scalar_one()
     activity = None
     if message:
         activity = models.Activity(board_id=board.id, user_id=actor.id, message=message)
@@ -158,7 +176,12 @@ def register(payload: schemas.RegisterIn, db: Session = Depends(get_db)):
         color=models.AVATAR_COLORS[count % len(models.AVATAR_COLORS)],
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Deux inscriptions simultanées avec le même e-mail : l'index unique tranche
+        db.rollback()
+        raise HTTPException(409, "Un compte existe déjà avec cet e-mail")
     db.refresh(user)
     return {"token": create_token(user.id), "user": user_out(user)}
 
@@ -200,18 +223,23 @@ def list_boards(user: models.User = Depends(get_current_user), db: Session = Dep
         db.query(models.Membership)
         .options(selectinload(models.Membership.user))
         .filter(models.Membership.board_id.in_(board_ids))
+        .order_by(models.Membership.id)  # sans ORDER BY, Postgres ne garantit aucun ordre
     ):
         members.setdefault(m.board_id, []).append(member_out(m))
 
-    out = [
+    # Tri sur la date elle-même (et non sa chaîne ISO), départagé par id : ordre stable quel que
+    # soit l'ordre de lecture des lignes
+    rows = sorted(
+        ((m, b) for m in memberships if (b := boards.get(m.board_id))),
+        key=lambda mb: (mb[1].created_at, mb[1].id), reverse=True,
+    )
+    return [
         {
             "id": b.id, "name": b.name, "role": m.role, "created_at": b.created_at.isoformat(),
             "card_count": card_counts.get(b.id, 0), "members": members.get(b.id, []),
         }
-        for m in memberships
-        if (b := boards.get(m.board_id))
+        for m, b in rows
     ]
-    return sorted(out, key=lambda b: b["created_at"], reverse=True)
 
 
 @app.post("/api/boards", status_code=201)
@@ -307,7 +335,12 @@ def add_member(
         raise HTTPException(409, f"{invitee.name} fait déjà partie du tableau")
     membership = models.Membership(board_id=board.id, user_id=invitee.id, role=models.MEMBER)
     db.add(membership)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Invitation simultanée de la même personne : la contrainte unique (board_id, user_id) tranche
+        db.rollback()
+        raise HTTPException(409, f"{invitee.name} fait déjà partie du tableau")
     return emit(db, background, board, user, "member.added", lambda: member_out(membership), f"a invité {invitee.name}")
 
 
@@ -338,7 +371,8 @@ def remove_member(
             .execution_options(synchronize_session=False)
         )
     unassigned = db.scalars(
-        select(models.Card).where(models.Card.id.in_(ids)).execution_options(populate_existing=True)
+        select(models.Card).where(models.Card.id.in_(ids)).order_by(models.Card.id)
+        .execution_options(populate_existing=True)
     ).all()
     message = "a quitté le tableau" if leaving_self else f"a retiré {name} du tableau"
     emit(db, background, board, user, "member.removed",
