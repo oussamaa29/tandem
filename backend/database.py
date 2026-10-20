@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 from sqlalchemy import MetaData, create_engine, event, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from config import settings
@@ -53,6 +54,14 @@ NAMING_CONVENTION = {
 Base = declarative_base(metadata=MetaData(naming_convention=NAMING_CONVENTION))
 
 
+def is_unique_violation(exc: IntegrityError) -> bool:
+    """Violation d'unicité (et non de clé étrangère, de NOT NULL…) : code SQLSTATE 23505 en
+    Postgres ; SQLite ne fournit qu'un message (« UNIQUE constraint failed: … »)."""
+    if getattr(exc.orig, "sqlstate", None) == "23505":
+        return True
+    return "UNIQUE constraint failed" in str(exc.orig)
+
+
 def alembic_config():
     from alembic.config import Config
 
@@ -62,14 +71,48 @@ def alembic_config():
     return cfg
 
 
+def _rebuild_legacy_sqlite_tables() -> None:
+    """Base SQLite créée avant Alembic par create_all : même schéma que la migration initiale,
+    mais contraintes (clés primaires, étrangères, unicité) sans nom. Chaque table est recréée à
+    l'identique avec les noms de NAMING_CONVENTION, données copiées, pour que les migrations
+    suivantes (et l'autogénération) voient exactement le schéma de la migration initiale.
+
+    Moteur dédié sans PRAGMA foreign_keys=ON : la recréation copie la table puis supprime
+    l'ancienne, ce qui déclencherait sinon les ON DELETE CASCADE des tables filles."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+    from sqlalchemy.pool import NullPool
+
+    import models  # noqa: F401  (enregistre les tables dans Base.metadata)
+
+    rebuild_engine = create_engine(DATABASE_URL, poolclass=NullPool)
+    try:
+        with rebuild_engine.begin() as conn:
+            op = Operations(MigrationContext.configure(conn))
+            for table in Base.metadata.sorted_tables:
+                with op.batch_alter_table(table.name, recreate="always", copy_from=table):
+                    pass
+                # Avec copy_from, Alembic ne recrée pas les index de l'ancienne table
+                for index in table.indexes:
+                    index.create(conn, checkfirst=True)
+    finally:
+        rebuild_engine.dispose()
+    # Les connexions déjà ouvertes gardent l'ancien schéma en cache pour les PRAGMA
+    engine.dispose()
+
+
 def upgrade_schema() -> None:
-    """Équivalent de `alembic upgrade head`. Une base créée avant Alembic (par create_all, sans
-    table alembic_version) est d'abord marquée comme étant à la migration initiale."""
+    """Équivalent de `alembic upgrade head`. Une base SQLite créée avant Alembic (par create_all,
+    sans table alembic_version) est d'abord remise aux noms de contraintes de la migration
+    initiale, puis marquée comme étant à cette migration. Pas d'équivalent en Postgres : aucune
+    base de production n'a été créée par create_all, et une base inconnue doit faire échouer la
+    migration (« table already exists ») plutôt qu'être adoptée en silence."""
     from alembic import command
 
     cfg = alembic_config()
     tables = inspect(engine).get_table_names()
-    if "alembic_version" not in tables and "users" in tables:
+    if is_sqlite and "alembic_version" not in tables and "users" in tables:
+        _rebuild_legacy_sqlite_tables()
         command.stamp(cfg, INITIAL_REVISION)
     command.upgrade(cfg, "head")
 

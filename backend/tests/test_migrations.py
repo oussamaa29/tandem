@@ -3,10 +3,10 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from conftest import drop_schema
-from database import Base, alembic_config, engine, normalize_url, upgrade_schema
+from database import Base, alembic_config, engine, is_sqlite, normalize_url, upgrade_schema
 
 
 @pytest.fixture
@@ -61,14 +61,106 @@ def test_downgrade_removes_everything_and_upgrade_is_repeatable(empty_db):
     assert set(Base.metadata.tables) <= set(inspect(engine).get_table_names())
 
 
-def test_database_created_before_alembic_is_stamped_not_recreated(empty_db):
-    # Base locale créée par l'ancien create_all : même schéma que la migration initiale, sans
-    # table alembic_version. Elle est marquée comme migrée, sans erreur « table already exists ».
-    Base.metadata.create_all(bind=engine)
+# Schéma exact produit par l'ancien create_all (avant Alembic et la convention de nommage) :
+# contraintes sans nom. Figé ici, car les modèles actuels ne savent plus le produire.
+LEGACY_SQLITE_SCHEMA = """
+CREATE TABLE users (
+    id INTEGER NOT NULL, email VARCHAR(255) NOT NULL, name VARCHAR(80) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL, color VARCHAR(9) NOT NULL, created_at DATETIME,
+    PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX ix_users_email ON users (email);
+CREATE TABLE boards (
+    id INTEGER NOT NULL, name VARCHAR(120) NOT NULL, owner_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL, created_at DATETIME,
+    PRIMARY KEY (id), FOREIGN KEY(owner_id) REFERENCES users (id)
+);
+CREATE TABLE memberships (
+    id INTEGER NOT NULL, board_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role VARCHAR(10) NOT NULL,
+    PRIMARY KEY (id), UNIQUE (board_id, user_id),
+    FOREIGN KEY(board_id) REFERENCES boards (id) ON DELETE CASCADE, FOREIGN KEY(user_id) REFERENCES users (id)
+);
+CREATE INDEX ix_memberships_board_id ON memberships (board_id);
+CREATE INDEX ix_memberships_user_id ON memberships (user_id);
+CREATE TABLE columns (
+    id INTEGER NOT NULL, board_id INTEGER NOT NULL, name VARCHAR(60) NOT NULL, position FLOAT NOT NULL,
+    PRIMARY KEY (id), FOREIGN KEY(board_id) REFERENCES boards (id) ON DELETE CASCADE
+);
+CREATE INDEX ix_columns_board_id ON columns (board_id);
+CREATE TABLE activities (
+    id INTEGER NOT NULL, board_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+    message VARCHAR(300) NOT NULL, created_at DATETIME,
+    PRIMARY KEY (id), FOREIGN KEY(board_id) REFERENCES boards (id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users (id)
+);
+CREATE INDEX ix_activities_created_at ON activities (created_at);
+CREATE INDEX ix_activities_board_id ON activities (board_id);
+CREATE TABLE cards (
+    id INTEGER NOT NULL, board_id INTEGER NOT NULL, column_id INTEGER NOT NULL, title VARCHAR(200) NOT NULL,
+    description TEXT NOT NULL, position FLOAT NOT NULL, assignee_id INTEGER, version INTEGER NOT NULL,
+    created_by_id INTEGER NOT NULL, created_at DATETIME, updated_at DATETIME,
+    PRIMARY KEY (id), FOREIGN KEY(board_id) REFERENCES boards (id) ON DELETE CASCADE,
+    FOREIGN KEY(column_id) REFERENCES columns (id) ON DELETE CASCADE,
+    FOREIGN KEY(assignee_id) REFERENCES users (id) ON DELETE SET NULL,
+    FOREIGN KEY(created_by_id) REFERENCES users (id)
+);
+CREATE INDEX ix_cards_column_id ON cards (column_id);
+CREATE INDEX ix_cards_board_id ON cards (board_id);
+
+INSERT INTO users VALUES (1, 'alice@example.com', 'Alice', 'h', '#6366f1', '2026-01-01 10:00:00');
+INSERT INTO users VALUES (2, 'bob@example.com', 'Bob', 'h', '#0ea5e9', '2026-01-01 10:00:00');
+INSERT INTO boards VALUES (1, 'Projet', 1, 3, '2026-01-01 10:00:00');
+INSERT INTO memberships VALUES (1, 1, 1, 'owner');
+INSERT INTO memberships VALUES (2, 1, 2, 'member');
+INSERT INTO columns VALUES (1, 1, 'À faire', 1024.0);
+INSERT INTO cards VALUES (1, 1, 1, 'Spec', 'Texte', 1536.5, 2, 4, 1, '2026-01-01 10:00:00', '2026-01-02 10:00:00');
+INSERT INTO activities VALUES (1, 1, 1, 'a créé le tableau', '2026-01-01 10:00:00');
+"""
+
+
+def _rows(table):
+    with engine.connect() as conn:
+        return [tuple(r) for r in conn.execute(text(f'SELECT * FROM "{table}" ORDER BY id'))]
+
+
+@pytest.mark.skipif(not is_sqlite, reason="seules des bases SQLite locales ont été créées par create_all")
+def test_database_created_before_alembic_is_upgraded_in_place(empty_db):
+    """Base locale créée par l'ancien create_all : pas d'erreur « table already exists », données
+    conservées, et contraintes renommées selon la convention, sinon la prochaine autogénération
+    produirait de fausses différences et les migrations visant ces noms échoueraient."""
+    raw = engine.raw_connection()
+    try:
+        raw.driver_connection.executescript(LEGACY_SQLITE_SCHEMA)
+    finally:
+        raw.close()
+    engine.dispose()
+    before = {t: _rows(t) for t in Base.metadata.tables}
+    assert inspect(engine).get_unique_constraints("memberships")[0]["name"] is None
+
     upgrade_schema()
+    engine.dispose()
+
     head = ScriptDirectory.from_config(alembic_config()).get_current_head()
     with engine.connect() as conn:
         assert MigrationContext.configure(conn).get_current_revision() == head
+        assert compare_metadata(MigrationContext.configure(conn, opts={"compare_type": True}), Base.metadata) == []
+        assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+    assert {t: _rows(t) for t in Base.metadata.tables} == before
+
+    insp = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        assert insp.get_pk_constraint(table.name)["name"] == table.primary_key.name
+        assert {fk["name"] for fk in insp.get_foreign_keys(table.name)} == {
+            fk.name for fk in table.foreign_key_constraints
+        }
+        assert {ix["name"] for ix in insp.get_indexes(table.name)} == {ix.name for ix in table.indexes}
+    assert [u["name"] for u in insp.get_unique_constraints("memberships")] == ["uq_memberships_board_id_user_id"]
+
+    # Les ON DELETE CASCADE fonctionnent toujours après la recréation des tables
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM boards WHERE id = 1"))
+    assert [_rows(t) for t in ("memberships", "columns", "cards", "activities")] == [[], [], [], []]
+    assert len(_rows("users")) == 2
 
 
 def test_postgres_urls_use_psycopg3():
