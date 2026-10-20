@@ -27,7 +27,7 @@ Un CRUD affiche des données ; une app collaborative doit les garder **cohérent
 | Base de données | SQLite par défaut (zéro installation), PostgreSQL (psycopg 3) via `DATABASE_URL` |
 | Auth | bcrypt (sur un condensé SHA-256, pour les mots de passe de plus de 72 octets) + JWT (en en-tête pour REST ; pour le WebSocket, en premier message après l'ouverture, jamais dans l'URL qui finirait dans les journaux d'accès) |
 | Temps réel multi-instances | Redis (pub/sub + présence partagée), optionnel via `REDIS_URL` |
-| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées, plusieurs instances reliées par Redis et la vérification des migrations (56 tests), exécutés en CI sur SQLite, PostgreSQL 16 **et** Redis 7 |
+| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées, plusieurs instances reliées par Redis et la vérification des migrations (60 tests), exécutés en CI sur SQLite, PostgreSQL 16 **et** Redis 7 |
 
 Aucun service payant.
 
@@ -125,12 +125,15 @@ Aucune affinité de session (« sticky sessions ») n'est nécessaire : REST et 
 |---|---|
 | Événements (`card.moved`…), retrait d'un membre (fermeture 4403), suppression du tableau (4404) | **Globale** : publiés sur `tandem:board:<id>`, chaque instance les remet à ses connexions. L'instance qui publie reçoit son propre message par l'abonnement, comme les autres (pas de double envoi), et l'ordre des événements d'un même émetteur est conservé |
 | Présence et « Sarah modifie… » | **Globale** : chaque instance écrit ses utilisateurs dans `tandem:presence:<id>` (un champ par instance) ; toute modification déclenche la diffusion de la liste fusionnée, dédoublonnée par utilisateur (plusieurs onglets ou instances) |
-| Connexions WebSocket, verrou d'envoi par connexion | **Locale** à l'instance |
+| Connexions WebSocket, file d'envoi et tâche d'écriture par connexion | **Locale** à l'instance |
 
 Pannes :
 
+- **Client lent ou bloqué** : diffuser ne fait que mettre en file (une file et une tâche d'écriture par connexion, ordre conservé), donc un client qui ne lit plus ne retarde ni les autres membres ni les autres tableaux. Si sa file déborde (256 messages) ou qu'un envoi dépasse 10 s, sa connexion est fermée (code 4408) : le client se reconnecte et recharge le tableau. Valable aussi sans Redis.
 - **Instance arrêtée brutalement** : sa clé de vie (TTL 15 s, rafraîchie toutes les 5 s) expire ; une autre instance la retire alors de la présence et diffuse la liste à jour. Un arrêt normal la retire immédiatement.
-- **Redis indisponible** : l'erreur est journalisée, chaque instance continue de servir ses propres connexions (diffusion locale uniquement) et l'abonnement se reconnecte avec un délai exponentiel (0,5 s → 10 s). Les événements perdus entre instances pendant la coupure sont rattrapés par les clients, qui détectent le trou dans les révisions et rechargent le tableau.
+- **Redis indisponible, ou abonnement d'une seule instance coupé** : l'erreur est journalisée, chaque instance continue de servir ses propres connexions (diffusion locale uniquement) et l'abonnement se reconnecte avec un délai exponentiel (0,5 s → 10 s). Ce qui a été publié ailleurs pendant la coupure est perdu pour cette instance :
+  - les **événements** sont rattrapés par les clients, qui détectent le trou dans les révisions et rechargent le tableau ;
+  - les **retraits de membre et suppressions de tableau** ne laissent pas de trou de révision : à chaque réabonnement, avant de remettre le moindre message, l'instance revérifie donc en base les droits de toutes ses connexions et ferme celles des membres retirés (4403) et des tableaux supprimés (4404).
 
 ## Accessibilité & UX
 

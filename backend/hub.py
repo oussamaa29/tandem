@@ -4,6 +4,11 @@ Les modifications passent par l'API REST (validées et transactionnelles), puis 
 résultant est diffusé ici à tous les membres connectés au tableau. Le WebSocket ne sert, dans
 l'autre sens, qu'à des signaux éphémères : présence et « est en train de modifier ».
 
+Chaque connexion a sa file d'envoi et sa tâche d'écriture : diffuser ne fait que mettre en file,
+sans jamais attendre un client. Un client qui ne lit plus ne retarde donc ni les autres
+connexions ni les autres tableaux ; si sa file déborde, ou si un envoi dépasse le délai, sa
+connexion est fermée (4408) et le client se reconnecte puis se resynchronise.
+
 Deux modes :
 
 - sans REDIS_URL (développement local) : tout est en mémoire, valable pour un seul processus ;
@@ -21,10 +26,15 @@ Deux modes :
       et rafraîchie par un battement régulier, permet d'écarter les utilisateurs d'une
       instance arrêtée brutalement.
 
-Redis indisponible : on journalise, les messages sont remis aux seules connexions de cette
-instance, et l'abonnement se reconnecte avec un délai exponentiel. Les événements perdus
-pendant la coupure sont rattrapés par les clients, qui se resynchronisent en voyant un trou
-dans les révisions du tableau.
+Abonnement Redis coupé (Redis arrêté, ou seulement la connexion de cette instance) : on
+journalise, les messages publiés ici sont remis directement aux connexions locales, et
+l'abonnement se reconnecte avec un délai exponentiel. Ce qui a été publié ailleurs pendant la
+coupure est perdu pour cette instance :
+    * les événements sont rattrapés par les clients, qui se resynchronisent en voyant un trou
+      dans les révisions du tableau ;
+    * les retraits de membre et suppressions de tableau ne le seraient pas : à chaque
+      réabonnement, les connexions locales sont donc revalidées auprès de la base (callback
+      `revalidate`, fourni par main.py) avant de recevoir quoi que ce soit.
 """
 
 import asyncio
@@ -32,6 +42,8 @@ import json
 import logging
 import random
 import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 import redis.asyncio as aioredis
@@ -48,8 +60,16 @@ INSTANCE_TTL_SECONDS = 15.0
 # Reconnexion de l'abonnement Redis : délai doublé à chaque échec, plafonné
 RETRY_MIN_SECONDS = 0.5
 RETRY_MAX_SECONDS = 10.0
+# Client trop lent : file d'envoi pleine ou envoi bloqué trop longtemps → connexion fermée
+OUTBOX_MAX = 256
+SEND_TIMEOUT_SECONDS = 10.0
+CLOSE_TIMEOUT_SECONDS = 2.0
+SLOW_CLIENT_CODE = 4408
 
 REDIS_ERRORS = (RedisError, OSError, asyncio.TimeoutError)
+
+# {tableau: utilisateurs connectés ici} → {tableau: membres actuels, ou None si supprimé}
+Revalidator = Callable[[dict[int, set[int]]], Awaitable[dict[int, set[int] | None]]]
 
 
 @dataclass(eq=False)
@@ -60,15 +80,73 @@ class Peer:
     color: str
     editing_card_id: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    outbox: deque = field(default_factory=deque)
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # Fermeture demandée : effectuée par la tâche d'écriture APRÈS les messages déjà en file
+    close_code: int | None = None
+    # Appelé quand un envoi échoue (connexion morte ou client bloqué)
+    on_dead: Callable[["Peer"], Awaitable[None]] | None = None
+    writer: asyncio.Task | None = None
 
-    async def send(self, message: dict) -> bool:
-        try:
-            # Un verrou par connexion : deux diffusions simultanées ne s'entremêlent pas
-            async with self.lock:
-                await self.ws.send_json(message)
-            return True
-        except Exception:
+    def start(self):
+        self.writer = asyncio.create_task(self._write_loop())
+
+    def send(self, message: dict) -> bool:
+        """Met en file sans attendre le client. False si la connexion est fermée ou va l'être."""
+        if self.close_code is not None:
             return False
+        if len(self.outbox) >= OUTBOX_MAX:
+            logger.warning("File d'envoi pleine pour l'utilisateur %s : connexion fermée", self.user_id)
+            self.abort(SLOW_CLIENT_CODE)
+            return False
+        self.outbox.append(message)
+        self.wake.set()
+        return True
+
+    def close(self, code: int):
+        if self.close_code is None:
+            self.close_code = code
+            self.wake.set()
+
+    def abort(self, code: int):
+        """Client trop lent : abandonne la file et l'envoi en cours, ferme sans attendre."""
+        self.outbox.clear()
+        self.close_code = code
+        if self.writer is not None:
+            self.writer.cancel()
+        self.writer = asyncio.create_task(self._close_ws())
+
+    async def _close_ws(self):
+        try:
+            await asyncio.wait_for(self.ws.close(code=self.close_code or SLOW_CLIENT_CODE), CLOSE_TIMEOUT_SECONDS)
+        except Exception:
+            pass  # déjà fermée par le client
+
+    def discard(self):
+        """Le client est parti : plus rien à lui envoyer (une fermeture demandée va à son terme)."""
+        if self.close_code is None and self.writer is not None:
+            self.writer.cancel()
+
+    async def _write_loop(self):
+        failed = False
+        try:
+            while True:
+                while self.outbox:
+                    message = self.outbox.popleft()
+                    # Un seul écrivain par connexion, et le verrou en plus : jamais d'envois entremêlés
+                    async with self.lock:
+                        await asyncio.wait_for(self.ws.send_json(message), SEND_TIMEOUT_SECONDS)
+                if self.close_code is not None:
+                    break
+                self.wake.clear()
+                await self.wake.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True  # connexion morte, ou client qui ne lit plus
+        await self._close_ws()
+        if failed and self.on_dead is not None:
+            await self.on_dead(self)
 
 
 class Hub:
@@ -77,6 +155,7 @@ class Hub:
         redis_url: str | None = None,
         *,
         redis_client=None,
+        revalidate: Revalidator | None = None,
         instance_id: str | None = None,
         prefix: str = "tandem",
         heartbeat: float = HEARTBEAT_SECONDS,
@@ -88,6 +167,7 @@ class Hub:
         self.redis_url = redis_url
         # Client fourni de l'extérieur (tests) : ni créé ni fermé par le hub
         self._external_client = redis_client
+        self.revalidate = revalidate
         self.instance_id = instance_id or uuid.uuid4().hex[:12]
         self.prefix = prefix
         self.heartbeat = heartbeat
@@ -98,6 +178,9 @@ class Hub:
         self._tasks: list[asyncio.Task] = []
         # Vrai quand l'abonnement Redis est actif : les messages locaux arrivent alors par lui
         self._subscribed = False
+        # Écritures de présence sérialisées par tableau, et tableaux où notre champ existe
+        self._presence_locks: dict[int, asyncio.Lock] = {}
+        self._presence_written: set[int] = set()
 
     # ---------------- Cycle de vie (lifespan FastAPI) ----------------
 
@@ -125,12 +208,13 @@ class Hub:
         # Arrêt propre : nos utilisateurs disparaissent tout de suite de la présence des autres
         try:
             async with asyncio.timeout(2):
-                for board_id in list(self.rooms):
+                for board_id in set(self.rooms) | self._presence_written:
                     await self._redis.hdel(self._presence_key(board_id), self.instance_id)
                     await self._redis.publish(self._channel(board_id), json.dumps({"kind": "presence"}))
                 await self._redis.delete(self._instance_key)
         except REDIS_ERRORS:
             pass
+        self._presence_written.clear()
         if self._external_client is None:
             await self._redis.aclose()
         self._redis = None
@@ -153,7 +237,11 @@ class Hub:
         return list(users.values())
 
     async def join(self, board_id: int, ws: WebSocket, user_id: int, name: str, color: str) -> Peer:
-        peer = Peer(ws=ws, user_id=user_id, name=name, color=color)
+        async def on_dead(peer: Peer):
+            await self._drop(board_id, peer)
+
+        peer = Peer(ws=ws, user_id=user_id, name=name, color=color, on_dead=on_dead)
+        peer.start()
         self.rooms.setdefault(board_id, {})[ws] = peer
         await self._presence_changed(board_id)
         return peer
@@ -162,7 +250,7 @@ class Hub:
         room = self.rooms.get(board_id)
         if room is None or ws not in room:
             return
-        del room[ws]
+        room.pop(ws).discard()
         if not room:
             del self.rooms[board_id]
         await self._presence_changed(board_id)
@@ -209,36 +297,62 @@ class Hub:
         if self._redis is None:
             await self._handle(board_id, envelope)
             return
+        # Abonnement coupé : le message est remis ici directement, et marqué pour que notre
+        # abonnement, s'il revient entre-temps, ne le remette pas une seconde fois
+        local = not self._subscribed
+        envelope = {**envelope, "origin": self.instance_id, "local": local}
         try:
             await self._redis.publish(self._channel(board_id), json.dumps(envelope))
         except REDIS_ERRORS as exc:
             logger.warning("Publication Redis impossible (%s) : remise aux connexions locales uniquement", exc)
-            await self._handle(board_id, envelope)
-            return
-        if not self._subscribed:
-            # Abonnement coupé : le message ne nous reviendra pas, on le remet nous-mêmes
+            local = True
+        if local:
             await self._handle(board_id, envelope)
 
     async def _handle(self, board_id: int, envelope: dict):
+        """Traite un message pour les connexions locales. Ne fait jamais attendre un client."""
         kind = envelope.get("kind")
         if kind == "event":
             await self._send_all(board_id, envelope["event"])
         elif kind == "presence":
             await self._send_presence(board_id)
         elif kind == "kick":
-            for peer in self.peers(board_id):
-                if peer.user_id == envelope["user_id"]:
-                    await self._close(peer, envelope["code"])
-                    await self.leave(board_id, peer.ws)
+            await self._kick_local(board_id, {envelope["user_id"]}, envelope["code"])
         elif kind == "close":
-            for peer in self.peers(board_id):
-                await self._close(peer, envelope["code"])
-            self.rooms.pop(board_id, None)
-            if self._redis is not None:
-                try:
-                    await self._redis.hdel(self._presence_key(board_id), self.instance_id)
-                except REDIS_ERRORS:
-                    pass
+            await self._close_local(board_id, envelope["code"])
+
+    async def _kick_local(self, board_id: int, user_ids: set[int], code: int):
+        for peer in self.peers(board_id):
+            if peer.user_id in user_ids:
+                peer.close(code)
+                await self.leave(board_id, peer.ws)
+
+    async def _close_local(self, board_id: int, code: int):
+        for peer in self.peers(board_id):
+            peer.close(code)
+        self.rooms.pop(board_id, None)
+        if self._redis is not None:
+            try:
+                await self._write_presence(board_id)
+            except REDIS_ERRORS:
+                pass
+
+    async def _revalidate_peers(self):
+        """Après une coupure de l'abonnement : ferme les connexions dont l'utilisateur n'est plus
+        membre (4403) et celles des tableaux supprimés (4404), retraits manqués pendant la coupure."""
+        if self.revalidate is None or not self.rooms:
+            return
+        connected = {board_id: {p.user_id for p in self.peers(board_id)} for board_id in list(self.rooms)}
+        try:
+            members = await self.revalidate(connected)
+        except Exception:
+            logger.exception("Revalidation des connexions impossible")
+            return
+        for board_id, allowed in members.items():
+            if allowed is None:
+                await self._close_local(board_id, 4404)
+            else:
+                await self._kick_local(board_id, connected[board_id] - allowed, 4403)
 
     # ---------------- Présence ----------------
 
@@ -251,13 +365,19 @@ class Hub:
         await self._fanout(board_id, {"kind": "presence"})
 
     async def _write_presence(self, board_id: int):
-        key = self._presence_key(board_id)
-        users = self.presence(board_id)
-        if users:
-            await self._redis.hset(key, self.instance_id, json.dumps(users))
-            await self._redis.pexpire(key, self._ttl_ms)
-        else:
-            await self._redis.hdel(key, self.instance_id)
+        # Sérialisé par tableau, instantané pris SOUS le verrou : deux départs simultanés (ou un
+        # départ et le battement) ne peuvent pas appliquer leurs écritures dans le désordre et
+        # laisser un champ périmé avec des utilisateurs partis
+        async with self._presence_locks.setdefault(board_id, asyncio.Lock()):
+            key = self._presence_key(board_id)
+            users = self.presence(board_id)
+            if users:
+                await self._redis.hset(key, self.instance_id, json.dumps(users))
+                await self._redis.pexpire(key, self._ttl_ms)
+                self._presence_written.add(board_id)
+            else:
+                await self._redis.hdel(key, self.instance_id)
+                self._presence_written.discard(board_id)
 
     async def _alive(self, instance_ids: list[str]) -> set[str]:
         if not instance_ids:
@@ -310,10 +430,15 @@ class Hub:
             await asyncio.sleep(self.heartbeat)
             try:
                 await self._touch_instance()
-                for board_id in list(self.rooms):
+                # Tableaux encore occupés ici (champ rafraîchi), et tableaux quittés dont le champ
+                # existe encore (supprimé : filet de sécurité si sa suppression a échoué)
+                for board_id in set(self.rooms) | self._presence_written:
                     await self._write_presence(board_id)
-                    if await self._sweep(board_id):
+                    if board_id in self.rooms and await self._sweep(board_id):
                         await self._fanout(board_id, {"kind": "presence"})
+                for board_id, lock in list(self._presence_locks.items()):
+                    if board_id not in self.rooms and board_id not in self._presence_written and not lock.locked():
+                        del self._presence_locks[board_id]
             except REDIS_ERRORS as exc:
                 logger.debug("Battement Redis impossible (%s)", exc)
 
@@ -323,11 +448,14 @@ class Hub:
             pubsub = self._redis.pubsub()
             try:
                 await pubsub.psubscribe(f"{self.prefix}:board:*")
+                await self._touch_instance()
+                # Avant de remettre quoi que ce soit : rattrape les retraits et suppressions publiés
+                # pendant une coupure (les messages arrivés depuis attendent dans l'abonnement)
+                await self._revalidate_peers()
                 self._subscribed = True
                 delay = self.retry_min
                 logger.info("Abonné à Redis (instance %s)", self.instance_id)
                 # Après une coupure : republie notre présence, que les autres ont pu perdre
-                await self._touch_instance()
                 for board_id in list(self.rooms):
                     await self._presence_changed(board_id)
                 while True:
@@ -351,7 +479,10 @@ class Hub:
             if isinstance(channel, bytes):
                 channel, data = channel.decode(), data.decode()
             board_id = int(channel.rsplit(":", 1)[1])
-            await self._handle(board_id, json.loads(data))
+            envelope = json.loads(data)
+            if envelope.get("local") and envelope.get("origin") == self.instance_id:
+                return  # déjà remis directement par nous (abonnement coupé à la publication)
+            await self._handle(board_id, envelope)
         except REDIS_ERRORS:
             raise
         except Exception:
@@ -361,27 +492,24 @@ class Hub:
     # ---------------- Envoi aux connexions locales ----------------
 
     async def _send_all(self, board_id: int, message: dict):
-        peers = self.peers(board_id)
-        if not peers:
-            return
-        results = await asyncio.gather(*(p.send(message) for p in peers))
-        dead = [p for p, ok in zip(peers, results) if not ok]
+        # Mise en file seulement : aucun client ne peut ralentir la diffusion
+        dead = [p for p in self.peers(board_id) if not p.send(message)]
         for p in dead:
-            room = self.rooms.get(board_id)
-            if room is not None:
-                room.pop(p.ws, None)
-                if not room:
-                    del self.rooms[board_id]
+            await self._drop(board_id, p, notify=False)
         if dead:
             logger.info("%d connexion(s) morte(s) retirée(s) du tableau %s", len(dead), board_id)
             await self._presence_changed(board_id)
 
-    @staticmethod
-    async def _close(peer: Peer, code: int):
-        try:
-            await peer.ws.close(code=code)
-        except Exception:
-            pass
+    async def _drop(self, board_id: int, peer: Peer, notify: bool = True):
+        """Retire une connexion morte ou trop lente (si elle est encore dans la room)."""
+        room = self.rooms.get(board_id)
+        if room is None or room.get(peer.ws) is not peer:
+            return
+        del room[peer.ws]
+        if not room:
+            del self.rooms[board_id]
+        if notify:
+            await self._presence_changed(board_id)
 
 
 hub = Hub(settings.REDIS_URL)

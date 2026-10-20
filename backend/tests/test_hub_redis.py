@@ -12,7 +12,10 @@ from contextlib import asynccontextmanager
 import fakeredis
 import pytest
 import redis.asyncio as aioredis
+from redis.asyncio.client import PubSub
+from redis.exceptions import ConnectionError as RedisConnectionError
 
+import hub as hub_module
 from hub import Hub
 
 REAL_REDIS_URL = os.environ.get("TEST_REDIS_URL")
@@ -213,11 +216,11 @@ def test_redis_outage_degrades_to_local_delivery_then_recovers():
             server.connected = False
             # Les connexions de la même instance continuent de recevoir événements et présence
             await a.publish(BOARD, {"type": "card.created", "revision": 1})
-            assert len(alice_a.of_type("card.created")) == 1
+            await until(lambda: len(alice_a.of_type("card.created")) == 1)
             await a.join(BOARD, bob_a, 2, "Bob", "#222")
-            assert set(bob_a.users()) >= {"Alice", "Bob"}
+            await until(lambda: set(bob_a.users() or {}) >= {"Alice", "Bob"})
             await a.kick(BOARD, 2)
-            assert bob_a.closed == 4403
+            await until(lambda: bob_a.closed == 4403)
             assert not carol_b.of_type("card.created")  # perdu pour B : rattrapé via les révisions
 
             # Retour de Redis : l'abonnement se reconnecte (délai exponentiel) et tout repart
@@ -239,8 +242,134 @@ def test_without_redis_url_the_hub_stays_in_memory():
         ws = FakeWS()
         await local.join(BOARD, ws, 1, "Alice", "#111")
         await local.publish(BOARD, {"type": "card.created", "revision": 1})
-        assert local._tasks == [] and len(ws.of_type("card.created")) == 1
-        assert ws.users() == {"Alice": None}
+        await until(lambda: len(ws.of_type("card.created")) == 1)
+        assert local._tasks == [] and ws.users() == {"Alice": None}
         await local.stop()
+
+    run(scenario())
+
+
+@pytest.mark.skipif(bool(REAL_REDIS_URL), reason="coupure de l'abonnement simulée avec fakeredis uniquement")
+def test_kick_and_deletion_missed_during_subscription_outage_are_caught_on_resubscribe(monkeypatch):
+    """Seul l'abonnement de B tombe (Redis reste joignable : A publie normalement, sans repli
+    local). Le retrait de Bob et la suppression d'un tableau publiés pendant la coupure sont
+    perdus pour B : la revalidation auprès de la base au réabonnement les rattrape."""
+    async def scenario():
+        members = {BOARD: {1, 2}, BOARD + 1: {2}}
+        revalidations = []
+
+        async def revalidate(connected):
+            revalidations.append(connected)
+            return {board_id: members.get(board_id) for board_id in connected}
+
+        async with cluster() as ((a, b), _):
+            a.revalidate = b.revalidate = revalidate
+            alice_a, bob_b, bob_b2 = FakeWS(), FakeWS(), FakeWS()
+            await a.join(BOARD, alice_a, 1, "Alice", "#111")
+            await b.join(BOARD, bob_b, 2, "Bob", "#222")
+            await b.join(BOARD + 1, bob_b2, 2, "Bob", "#222")
+
+            original = PubSub.get_message
+            failing = {"once": True}
+
+            async def flaky_get_message(self, *args, **kwargs):
+                if self.connection_pool is b._redis.connection_pool and failing["once"]:
+                    failing["once"] = False
+                    raise RedisConnectionError("connexion d'abonnement de B coupée (simulée)")
+                return await original(self, *args, **kwargs)
+
+            monkeypatch.setattr(PubSub, "get_message", flaky_get_message)
+            await until(lambda: not b._subscribed)
+            members[BOARD].discard(2)  # Bob retiré du tableau…
+            await a.kick(BOARD, 2)  # …et le kick part pendant la coupure de B
+            del members[BOARD + 1]  # second tableau supprimé
+            await a.close_room(BOARD + 1)
+
+            await until(lambda: b._subscribed, timeout=5)
+            await until(lambda: bob_b.closed == 4403 and bob_b2.closed == 4404)
+            assert revalidations and b.rooms == {}
+            await a.publish(BOARD, {"type": "card.created", "revision": 99})
+            await until(lambda: alice_a.of_type("card.created"))
+            await asyncio.sleep(0.2)
+            assert not bob_b.of_type("card.created")  # plus rien après le retrait
+
+    run(scenario())
+
+
+class StalledWS(FakeWS):
+    """Client qui ne lit plus : chaque envoi reste bloqué (transport en pause)."""
+
+    async def send_json(self, message):
+        await asyncio.sleep(3600)
+
+
+def test_stalled_client_delays_neither_its_board_nor_other_boards():
+    async def scenario():
+        async with cluster() as ((a, b), _):
+            stalled, same_board, other_board = StalledWS(), FakeWS(), FakeWS()
+            await b.join(BOARD, stalled, 1, "Lent", "#111")
+            await b.join(BOARD, same_board, 2, "Bob", "#222")
+            await b.join(BOARD + 1, other_board, 3, "Carol", "#333")
+            await a.publish(BOARD, {"type": "card.moved", "revision": 1})
+            await a.publish(BOARD + 1, {"type": "card.created", "revision": 1})
+            await until(lambda: same_board.of_type("card.moved") and other_board.of_type("card.created"), timeout=1)
+
+    run(scenario())
+
+
+def test_slow_client_is_disconnected_when_its_queue_overflows_or_a_send_times_out(monkeypatch):
+    """Même chemin en mémoire et avec Redis : file pleine → fermeture 4408 ; envoi bloqué au-delà
+    du délai → connexion retirée et présence mise à jour."""
+    monkeypatch.setattr(hub_module, "OUTBOX_MAX", 3)
+    monkeypatch.setattr(hub_module, "SEND_TIMEOUT_SECONDS", 0.2)
+
+    async def scenario():
+        local = Hub()
+        stalled, alice = StalledWS(), FakeWS()
+        await local.join(BOARD, alice, 1, "Alice", "#111")
+        await local.join(BOARD, stalled, 2, "Lent", "#222")
+        # Envoi bloqué : au bout de 0,2 s la connexion est considérée morte et retirée
+        await until(lambda: alice.users() == {"Alice": None}, timeout=2)
+        assert [p.user_id for p in local.peers(BOARD)] == [1]
+
+        overflow = StalledWS()
+        monkeypatch.setattr(hub_module, "SEND_TIMEOUT_SECONDS", 60)
+        await local.join(BOARD, overflow, 3, "Débordé", "#333")
+        for revision in range(10):
+            await local.publish(BOARD, {"type": "card.moved", "revision": revision})
+            await asyncio.sleep(0.01)  # laisse écrire les clients qui lisent (file plafonnée à 3 ici)
+        await until(lambda: overflow.closed == hub_module.SLOW_CLIENT_CODE, timeout=2)
+        assert [p.user_id for p in local.peers(BOARD)] == [1]
+        assert len(alice.of_type("card.moved")) == 10  # les autres ne sont pas touchés
+
+    run(scenario())
+
+
+def test_concurrent_leaves_with_out_of_order_presence_writes_leave_no_ghost(monkeypatch):
+    """Deux départs simultanés dont la première écriture Redis est retardée : sans sérialisation,
+    elle arrivait après la seconde et laissait un champ périmé (utilisateur fantôme)."""
+    async def scenario():
+        async with cluster() as ((a, b), _):
+            alice, x, y = FakeWS(), FakeWS(), FakeWS()
+            await a.join(BOARD, alice, 1, "Alice", "#111")
+            await b.join(BOARD, x, 2, "X", "#222")
+            await b.join(BOARD, y, 3, "Y", "#333")
+            await until(lambda: alice.users() == {"Alice": None, "X": None, "Y": None})
+
+            original_hset = b._redis.hset
+            calls = []
+
+            async def delayed_first_hset(*args, **kwargs):
+                calls.append(args)
+                if len(calls) == 1:
+                    await asyncio.sleep(0.05)
+                return await original_hset(*args, **kwargs)
+
+            monkeypatch.setattr(b._redis, "hset", delayed_first_hset)
+            await asyncio.gather(b.leave(BOARD, x), b.leave(BOARD, y))
+            await until(lambda: alice.users() == {"Alice": None})
+            await asyncio.sleep(0.5)  # plusieurs battements : l'état reste correct
+            assert b.rooms == {} and alice.users() == {"Alice": None}
+            assert list(await a._redis.hgetall(a._presence_key(BOARD))) == [a.instance_id]
 
     run(scenario())

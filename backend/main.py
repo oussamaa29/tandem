@@ -643,6 +643,32 @@ def _is_member(board_id: int, user_id: int) -> bool:
         db.close()
 
 
+def _current_members(connected: dict[int, set[int]]) -> dict[int, set[int] | None]:
+    """Membres actuels des tableaux donnés parmi les utilisateurs connectés (None : tableau
+    supprimé). Deux requêtes pour tous les tableaux. Synchrone : exécuté hors de la boucle."""
+    db = SessionLocal()
+    try:
+        existing = set(db.scalars(select(models.Board.id).where(models.Board.id.in_(connected))))
+        members: dict[int, set[int]] = {board_id: set() for board_id in existing}
+        rows = db.execute(
+            select(models.Membership.board_id, models.Membership.user_id)
+            .where(models.Membership.board_id.in_(existing))
+        )
+        for board_id, user_id in rows:
+            members[board_id].add(user_id)
+        return {board_id: members.get(board_id) for board_id in connected}
+    finally:
+        db.close()
+
+
+async def _revalidate_connections(connected: dict[int, set[int]]) -> dict[int, set[int] | None]:
+    return await run_in_threadpool(_current_members, connected)
+
+
+# Après une coupure de son abonnement Redis, le hub revérifie les droits de ses connexions
+hub.revalidate = _revalidate_connections
+
+
 async def _receive_token(ws: WebSocket) -> str | None:
     """Premier message attendu : {"type": "auth", "token": …}. Le jeton ne passe pas dans l'URL,
     qui finirait dans les journaux d'accès (l'API WebSocket des navigateurs ne permet pas
