@@ -25,9 +25,9 @@ Un CRUD affiche des données ; une app collaborative doit les garder **cohérent
 | Frontend | React 19 + TypeScript (Vite), dnd-kit (glisser-déposer accessible au clavier), CSS maison avec design tokens et mode sombre |
 | Backend | FastAPI, WebSockets, SQLAlchemy 2, migrations Alembic |
 | Base de données | SQLite par défaut (zéro installation), PostgreSQL (psycopg 3) via `DATABASE_URL` |
-| Auth | bcrypt (sur un condensé SHA-256, pour les mots de passe de plus de 72 octets) + JWT (en en-tête pour REST ; pour le WebSocket, en premier message après l'ouverture, jamais dans l'URL qui finirait dans les journaux d'accès) |
+| Auth | bcrypt (sur un condensé SHA-256, pour les mots de passe de plus de 72 octets) + JWT (en en-tête pour REST ; pour le WebSocket, en premier message après l'ouverture, jamais dans l'URL qui finirait dans les journaux d'accès) ; « Continuer avec Google / GitHub » en option (OAuth 2.0 + PKCE, OpenID Connect pour Google) |
 | Temps réel multi-instances | Redis (pub/sub + présence partagée), optionnel via `REDIS_URL` |
-| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées, plusieurs instances reliées par Redis et la vérification des migrations (60 tests), exécutés en CI sur SQLite, PostgreSQL 16 **et** Redis 7 |
+| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées, plusieurs instances reliées par Redis, la connexion Google / GitHub (simulée, sans réseau) et la vérification des migrations (94 tests), exécutés en CI sur SQLite, PostgreSQL 16 **et** Redis 7 |
 
 Aucun service payant.
 
@@ -62,9 +62,36 @@ Le schéma est géré par **Alembic** (`backend/migrations/`).
 Modifier le schéma : changer `models.py`, puis générer et relire la migration (le test `test_migrations.py` échoue tant que modèles et migrations divergent) :
 
 ```bash
-alembic revision --autogenerate -m "ajoute les étiquettes" --rev-id 0002
+alembic revision --autogenerate -m "ajoute les étiquettes" --rev-id 0003
 alembic upgrade head
 ```
+
+#### Connexion avec Google / GitHub (facultatif)
+
+Les boutons « Continuer avec Google » et « Continuer avec GitHub » n'apparaissent que si le fournisseur est configuré (identifiant **et** secret dans `backend/.env`). Les deux sont gratuits.
+
+**Google** ([Google Cloud Console](https://console.cloud.google.com/)) :
+
+1. Créer (ou choisir) un projet, puis *API et services → Écran de consentement OAuth* : type « Externe », laisser l'application en mode **Test** et ajouter son adresse dans les **utilisateurs test** (seuls eux pourront se connecter tant que l'application n'est pas publiée).
+2. *Identifiants → Créer des identifiants → ID client OAuth*, type **Application Web**.
+3. *URI de redirection autorisés* : `http://localhost:8040/api/auth/google/callback`.
+4. Reporter l'ID client et le secret dans `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
+
+**GitHub** (*Settings → Developer settings → OAuth Apps → New OAuth App*) :
+
+1. *Homepage URL* : `http://localhost:5176` ; *Authorization callback URL* : `http://localhost:8040/api/auth/github/callback`.
+2. Générer un secret client, puis renseigner `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`.
+
+En production, définir aussi `PUBLIC_API_URL` (adresse publique de l'API, qui sert à construire l'URL de retour déclarée chez le fournisseur) et `FRONTEND_URL` (où renvoyer l'utilisateur), et déclarer les URL de retour correspondantes.
+
+Ce qui protège le parcours :
+
+- **Flux « authorization code » côté serveur**, avec **PKCE** (S256) et un **`state`** aléatoire. Les deux sont gardés dans un cookie HttpOnly, SameSite=Lax, signé et valable 10 minutes (Secure dès que l'API est en https), et le `state` est comparé à temps constant au retour. Un retour qui ne vient pas du départ de ce navigateur est refusé, et le code n'est jamais échangé.
+- **Identité vérifiée** : l'id_token de Google est contrôlé (signature RS256 avec les clés publiques de Google, émetteur, audience = notre client, expiration). Pour GitHub, l'identité vient de son API, et seule l'adresse **principale et vérifiée** est retenue.
+- **Rattachement de comptes** : une identité déjà liée retrouve son compte (même si l'adresse a changé chez le fournisseur). Sinon, un compte existant avec la même adresse est rattaché, **uniquement si le fournisseur l'a vérifiée** (sans cela, n'importe qui pourrait s'emparer d'un compte en déclarant son adresse). Sinon, un compte sans mot de passe est créé. Un compte peut être lié à Google et à GitHub à la fois.
+- **Pas de jeton dans une URL** : au retour, l'application reçoit un **code de connexion à usage unique** (60 s, seul son condensé est en base, donc valable quelle que soit l'instance qui le reçoit), qu'elle échange par `POST /api/auth/exchange` contre la session.
+- **Pas d'énumération** : un compte créé via Google ou GitHub n'a pas de mot de passe ; s'y connecter par mot de passe renvoie le même 401 qu'un mot de passe faux.
+- Toute erreur (refus de l'utilisateur, `state` invalide, jeton refusé, adresse non vérifiée, fournisseur injoignable) renvoie vers l'écran de connexion avec un message clair, jamais vers une erreur brute.
 
 ### Frontend
 
@@ -154,6 +181,7 @@ tandem/
 │   ├── database.py    # Moteur SQLite / Postgres, pool, application des migrations
 │   ├── migrations/    # Migrations Alembic (schéma versionné)
 │   ├── auth.py        # bcrypt + JWT
+│   ├── oauth.py       # Google / GitHub : state + PKCE, identité, rattachement, code à usage unique
 │   └── tests/         # positions, droits, cartes, verrou optimiste, temps réel, migrations
 └── frontend/src/
     ├── useBoard.ts    # Connexion WebSocket, reconnexion, tampon, détection de trous

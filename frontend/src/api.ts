@@ -3,6 +3,14 @@ import type { Activity, Board, BoardSummary, Card, Column, Member, User } from "
 export const API_BASE: string = import.meta.env.VITE_API_BASE || "http://localhost:8040";
 const TOKEN_KEY = "tandem.token";
 
+export const OAUTH_PROVIDERS = ["google", "github"] as const;
+export type OAuthProvider = (typeof OAUTH_PROVIDERS)[number];
+export const OAUTH_LABELS: Record<OAuthProvider, string> = { google: "Google", github: "GitHub" };
+export const isOAuthProvider = (value: string | undefined): value is OAuthProvider =>
+  (OAUTH_PROVIDERS as readonly string[]).includes(value ?? "");
+/** Départ du parcours OAuth : simple lien, le serveur redirige vers le fournisseur. */
+export const oauthStartUrl = (provider: OAuthProvider) => `${API_BASE}/api/auth/${provider}/start`;
+
 export const session = {
   get: (): string | null => {
     try {
@@ -94,6 +102,9 @@ export const api = {
   login: (email: string, password: string) =>
     request<{ token: string; user: User }>("/api/auth/login", json("POST", { email, password })),
   me: () => request<User>("/api/me"),
+  providers: () => request<Record<OAuthProvider, boolean>>("/api/auth/providers"),
+  /** Code à usage unique reçu au retour de Google / GitHub → session. */
+  exchange: (code: string) => request<{ token: string; user: User }>("/api/auth/exchange", json("POST", { code })),
 
   listBoards: () => request<BoardSummary[]>("/api/boards"),
   createBoard: (name: string) => request<{ id: number; name: string }>("/api/boards", json("POST", { name })),
