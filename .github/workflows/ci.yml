@@ -8,6 +8,10 @@ on:
   schedule:
     - cron: "0 6 * * *"
 
+# Le workflow ne fait que lire le code : jeton restreint au strict nécessaire
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
