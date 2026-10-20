@@ -68,6 +68,37 @@ jobs:
       - run: pip install -r requirements.txt
       - run: pytest -q
 
+  # Plusieurs instances reliées par un vrai Redis : tests du hub (TEST_REDIS_URL) et toute la suite
+  # avec REDIS_URL, donc REST + WebSocket de bout en bout en mode distribué
+  backend-redis:
+    name: Backend (Redis)
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_REDIS_URL: redis://localhost:6379/0
+      REDIS_URL: redis://localhost:6379/0
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
   frontend:
     name: Frontend (lint + build)
     runs-on: ubuntu-latest

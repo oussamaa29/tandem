@@ -18,6 +18,8 @@ class Settings:
     JWT_SECRET: str = os.getenv("JWT_SECRET") or DEV_JWT_SECRET
     JWT_EXPIRE_HOURS: int = int(os.getenv("JWT_EXPIRE_HOURS", "72"))
     CORS_ORIGINS: list = os.getenv("CORS_ORIGINS", "http://localhost:5176").split(",")
+    # Diffusion entre plusieurs instances (pub/sub + présence partagée) ; absent : tout en mémoire
+    REDIS_URL: str | None = os.getenv("REDIS_URL") or None
 
 
 def check_secret(s: "Settings") -> None:
