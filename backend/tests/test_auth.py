@@ -1,9 +1,12 @@
 import logging
 
 import pytest
+from sqlalchemy import event, text
+from sqlalchemy.orm import Session
 
 from auth import hash_password, verify_password
 from config import DEV_JWT_SECRET, Settings, check_secret
+from database import engine
 
 
 def test_long_multibyte_password_can_register_and_login(client):
@@ -14,6 +17,28 @@ def test_long_multibyte_password_can_register_and_login(client):
     # Même préfixe de 72 octets : doit rester refusé (pas de troncature silencieuse)
     r = client.post("/api/auth/login", json={"email": "long@example.com", "password": password[:36] + "x" * 4})
     assert r.status_code == 401
+
+
+def test_concurrent_registration_with_same_email_is_409(client):
+    """Inscription concurrente validée entre la vérification de l'e-mail et l'insertion : c'est
+    l'index unique qui refuse, et la réponse reste un 409, pas une erreur 500."""
+    fired = []
+
+    @event.listens_for(Session, "before_flush")
+    def register_concurrently(session, _ctx, _instances):
+        if fired:
+            return
+        fired.append(True)
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO users (email, name, password_hash, color) "
+                              "VALUES ('dup@example.com', 'Autre', 'h', '#000000')"))
+
+    try:
+        r = client.post("/api/auth/register", json={"email": "dup@example.com", "name": "Dup", "password": "motdepasse123"})
+    finally:
+        event.remove(Session, "before_flush", register_concurrently)
+    assert fired
+    assert r.status_code == 409
 
 
 def test_login_with_very_long_password_is_401_not_500(client, alice):

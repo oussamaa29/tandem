@@ -26,7 +26,7 @@ Un CRUD affiche des données ; une app collaborative doit les garder **cohérent
 | Backend | FastAPI, WebSockets, SQLAlchemy 2, migrations Alembic |
 | Base de données | SQLite par défaut (zéro installation), PostgreSQL (psycopg 3) via `DATABASE_URL` |
 | Auth | bcrypt (sur un condensé SHA-256, pour les mots de passe de plus de 72 octets) + JWT (en en-tête pour REST ; pour le WebSocket, en premier message après l'ouverture, jamais dans l'URL qui finirait dans les journaux d'accès) |
-| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées et la vérification des migrations (43 tests), exécutés en CI sur SQLite **et** PostgreSQL 16 |
+| Tests | pytest, dont des tests multi-utilisateurs sur WebSocket, des courses entre requêtes simultanées et la vérification des migrations (48 tests), exécutés en CI sur SQLite **et** PostgreSQL 16 |
 
 Aucun service payant.
 
