@@ -24,8 +24,10 @@ class LoginIn(BaseModel):
 
 
 class ExchangeIn(BaseModel):
-    """Code de connexion à usage unique reçu au retour de Google / GitHub."""
+    """Code de connexion à usage unique reçu au retour de Google / GitHub, et nonce de l'onglet qui
+    a lancé la connexion. Nonce absent = nonce faux (400, code consommé), pas une erreur 422."""
     code: str = Field(min_length=1, max_length=200)
+    nonce: str | None = Field(None, max_length=200)
 
 
 class BoardIn(BaseModel):

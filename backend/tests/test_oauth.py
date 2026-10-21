@@ -8,13 +8,17 @@ from urllib.parse import parse_qs, urlsplit
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from starlette.websockets import WebSocketDisconnect
 
 import oauth
 from config import settings
+from conftest import receive_until
 
 GOOGLE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 FRONTEND = "http://localhost:5176"
+# Nonce de l'onglet qui lance la connexion (le frontend en tire 256 bits et le garde en sessionStorage)
+TAB_NONCE = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 
 class FakeProviders:
@@ -82,8 +86,8 @@ def fake(monkeypatch):
     return providers
 
 
-def start(client, provider):
-    r = client.get(f"/api/auth/{provider}/start", follow_redirects=False)
+def start(client, provider, nonce=TAB_NONCE):
+    r = client.get(f"/api/auth/{provider}/start", params={"nonce": nonce}, follow_redirects=False)
     assert r.status_code == 302, r.text
     return r, {k: v[0] for k, v in parse_qs(urlsplit(r.headers["location"]).query).items()}
 
@@ -97,12 +101,17 @@ def callback(client, provider, **params):
     return route, {k: v[0] for k, v in parse_qs(query).items()}
 
 
-def sign_in(client, provider):
-    """Parcours complet : départ, retour du fournisseur, échange du code. Renvoie la réponse finale."""
-    _, params = start(client, provider)
+def login_code(client, provider, nonce=TAB_NONCE):
+    """Départ et retour du fournisseur : code de connexion à usage unique, pas encore échangé."""
+    _, params = start(client, provider, nonce)
     route, query = callback(client, provider, code="code-fournisseur", state=params["state"])
     assert route == f"auth/{provider}", query
-    return client.post("/api/auth/exchange", json={"code": query["code"]})
+    return query["code"]
+
+
+def sign_in(client, provider):
+    """Parcours complet : départ, retour du fournisseur, échange du code. Renvoie la réponse finale."""
+    return client.post("/api/auth/exchange", json={"code": login_code(client, provider), "nonce": TAB_NONCE})
 
 
 def failure(client, provider, **callback_params):
@@ -158,8 +167,15 @@ def test_start_redirects_with_state_pkce_and_signed_cookie(client, fake, provide
 
 def test_cookie_is_secure_when_api_is_https(client, fake, monkeypatch):
     monkeypatch.setattr(settings, "PUBLIC_API_URL", "https://api.tandem.example")
-    r = client.get("/api/auth/google/start", follow_redirects=False)
+    r, _ = start(client, "google")
     assert "secure" in r.headers["set-cookie"].lower()
+
+
+@pytest.mark.parametrize("nonce", [None, "", "court", "x" * 129, "a" * 30 + "/" + "b" * 10, "é" * 40])
+def test_start_requires_a_well_formed_tab_nonce(client, fake, nonce):
+    params = {} if nonce is None else {"nonce": nonce}
+    r = client.get("/api/auth/google/start", params=params, follow_redirects=False)
+    assert r.status_code == 400 and oauth.STATE_COOKIE not in r.cookies
 
 
 # ---------------- Comptes ----------------
@@ -188,13 +204,45 @@ def test_github_name_falls_back_to_login(client, fake):
     assert sign_in(client, "github").json()["user"]["name"] == "gaby"
 
 
+def ws_close_code(ws):
+    with pytest.raises(WebSocketDisconnect) as exc:
+        for _ in range(10):
+            ws.receive_json()
+    return exc.value.code
+
+
 @pytest.mark.parametrize("provider", ["google", "github"])
-def test_existing_password_account_is_linked_by_verified_email(client, fake, alice, provider):
+def test_verified_email_takes_over_a_password_account_and_closes_its_sessions(client, fake, alice, board, provider):
+    """Pré-création de compte : quelqu'un s'inscrit par mot de passe avec l'adresse de la victime
+    (l'inscription ne vérifie pas l'adresse). Quand la victime arrive avec Google / GitHub, le
+    compte lui revient : l'ancien mot de passe ne marche plus et toutes les sessions ouvertes avec
+    sont fermées, REST comme WebSocket."""
+    old = {"Authorization": f"Bearer {alice.token}"}
+    # Jeton émis avant l'ajout de `ver` : lu comme version 0, valable jusqu'au rattachement
+    legacy_token = jwt.encode({"sub": str(alice.id), "exp": int(time.time()) + 3600}, settings.JWT_SECRET, algorithm="HS256")
+    assert client.get("/api/me", headers={"Authorization": f"Bearer {legacy_token}"}).status_code == 200
+
     fake.identity(provider, "2002", "ALICE@example.com", name="Alice G.")
-    r = sign_in(client, provider)
-    assert r.json()["user"]["id"] == alice.id and r.json()["user"]["name"] == "Alice"
-    # Le mot de passe reste utilisable
-    assert client.post("/api/auth/login", json={"email": "alice@example.com", "password": "motdepasse123"}).status_code == 200
+    with client.websocket_connect(f"/ws/boards/{board['id']}") as ws:
+        ws.send_json({"type": "auth", "token": alice.token})
+        receive_until(ws, "presence")
+        r = sign_in(client, provider)
+        # La connexion WebSocket ouverte avec l'ancienne session est fermée
+        assert ws_close_code(ws) == 4401
+
+    assert r.status_code == 200 and r.json()["user"]["id"] == alice.id and r.json()["user"]["name"] == "Alice"
+    new = {"Authorization": f"Bearer {r.json()['token']}"}
+    assert client.post("/api/auth/login", json={"email": "alice@example.com", "password": "motdepasse123"}).status_code == 401
+    assert client.get("/api/me", headers=old).status_code == 401
+    assert client.get("/api/me", headers={"Authorization": f"Bearer {legacy_token}"}).status_code == 401
+    assert client.get("/api/me", headers=new).status_code == 200
+    assert client.get(f"/api/boards/{board['id']}", headers=new).status_code == 200  # ses données lui restent
+    with client.websocket_connect(f"/ws/boards/{board['id']}") as ws:
+        ws.send_json({"type": "auth", "token": alice.token})
+        assert ws_close_code(ws) == 4401
+    with client.websocket_connect(f"/ws/boards/{board['id']}") as ws:
+        ws.send_json({"type": "auth", "token": r.json()["token"]})
+        assert receive_until(ws, "presence")["users"][0]["id"] == alice.id
 
 
 @pytest.mark.parametrize("provider", ["google", "github"])
@@ -208,8 +256,12 @@ def test_next_sign_in_uses_the_link_even_if_the_email_changed(client, fake, prov
 def test_same_account_can_link_google_and_github(client, fake, alice):
     fake.identity("google", "g-1", "alice@example.com")
     fake.identity("github", "77", "alice@example.com")
-    assert sign_in(client, "google").json()["user"]["id"] == alice.id
+    google_session = sign_in(client, "google").json()
+    assert google_session["user"]["id"] == alice.id
     assert sign_in(client, "github").json()["user"]["id"] == alice.id
+    # Le second fournisseur ne ferme rien : le compte appartient déjà à la personne dont l'adresse
+    # a été vérifiée au premier rattachement
+    assert client.get("/api/me", headers={"Authorization": f"Bearer {google_session['token']}"}).status_code == 200
     # Les deux liens sont réutilisés ensuite, même si les adresses divergent
     fake.identity("google", "g-1", "alice.google@example.com")
     fake.identity("github", "77", "alice.github@example.com")
@@ -233,7 +285,7 @@ def test_github_without_primary_email_is_refused(client, fake):
 
 # ---------------- id_token Google ----------------
 
-@pytest.mark.parametrize("tamper", ["aud", "iss", "exp", "signature", "missing_sub"])
+@pytest.mark.parametrize("tamper", ["aud", "iss", "exp", "iat_future", "signature", "missing_sub"])
 def test_invalid_google_id_token_is_refused(client, fake, tamper):
     fake.identity("google", "6006", "gaby@example.com")
     if tamper == "aud":
@@ -241,7 +293,9 @@ def test_invalid_google_id_token_is_refused(client, fake, tamper):
     elif tamper == "iss":
         fake.id_claims["iss"] = "https://accounts.evil.example"
     elif tamper == "exp":
-        fake.id_claims["exp"] = int(time.time()) - 60
+        fake.id_claims["exp"] = int(time.time()) - 300  # bien au-delà de la tolérance d'horloge
+    elif tamper == "iat_future":
+        fake.id_claims["iat"] = int(time.time()) + 300
     elif tamper == "signature":
         fake.id_key = OTHER_KEY
     else:
@@ -252,6 +306,14 @@ def test_invalid_google_id_token_is_refused(client, fake, tamper):
 def test_google_short_issuer_is_accepted(client, fake):
     fake.identity("google", "6007", "gaby@example.com")
     fake.id_claims["iss"] = "accounts.google.com"
+    assert sign_in(client, "google").status_code == 200
+
+
+def test_google_id_token_tolerates_small_clock_skew(client, fake):
+    """Horloge du serveur légèrement en retard sur celle de Google : iat de quelques secondes
+    dans le futur, toléré (60 s)."""
+    fake.identity("google", "6008", "gaby@example.com")
+    fake.id_claims["iat"] = int(time.time()) + 2
     assert sign_in(client, "google").status_code == 200
 
 
@@ -299,7 +361,7 @@ def test_user_cancelling_at_provider_is_reported(client, fake, provider):
 
 
 def test_unexpected_error_redirects_instead_of_500(client, fake, monkeypatch):
-    def broken(db, provider, identity):
+    def broken(db, provider, identity) -> tuple:
         raise RuntimeError("base indisponible")
 
     fake.identity("google", "9009", "gaby@example.com")
@@ -309,22 +371,45 @@ def test_unexpected_error_redirects_instead_of_500(client, fake, monkeypatch):
 
 # ---------------- Code de connexion ----------------
 
+def exchange(client, code, nonce=TAB_NONCE):
+    return client.post("/api/auth/exchange", json={"code": code} if nonce is None else {"code": code, "nonce": nonce})
+
+
 def test_login_code_is_single_use(client, fake):
     fake.identity("google", "1111", "gaby@example.com")
-    _, params = start(client, "google")
-    _, query = callback(client, "google", code="code-fournisseur", state=params["state"])
-    assert client.post("/api/auth/exchange", json={"code": query["code"]}).status_code == 200
-    replay = client.post("/api/auth/exchange", json={"code": query["code"]})
+    code = login_code(client, "google")
+    assert exchange(client, code).status_code == 200
+    replay = exchange(client, code)
     assert replay.status_code == 400 and replay.json()["detail"] == "Code de connexion invalide ou expiré"
-    assert client.post("/api/auth/exchange", json={"code": "invente"}).status_code == 400
+    assert exchange(client, "invente").status_code == 400
 
 
 def test_login_code_expires(client, fake, monkeypatch):
     monkeypatch.setattr(oauth, "LOGIN_CODE_TTL", timedelta(seconds=-1))
     fake.identity("github", "2222", "gaby@example.com")
-    _, params = start(client, "github")
-    _, query = callback(client, "github", code="code-fournisseur", state=params["state"])
-    assert client.post("/api/auth/exchange", json={"code": query["code"]}).status_code == 400
+    assert exchange(client, login_code(client, "github")).status_code == 400
+
+
+@pytest.mark.parametrize("provider", ["google", "github"])
+def test_login_code_from_another_browser_is_useless(client, fake, provider):
+    """Login CSRF : l'attaquant mène son propre parcours, garde le code de retour et envoie à sa
+    victime le lien #/auth/<fournisseur>?code=…. L'onglet de la victime n'a pas le nonce de
+    l'attaquant : l'échange échoue, et le code est consommé dès cette tentative."""
+    fake.identity(provider, "666", "attaquant@example.com", name="Attaquant")
+    attacker_code = login_code(client, provider, nonce="a" * 64)
+    victim_tab_nonce = "v" * 64
+    assert exchange(client, attacker_code, victim_tab_nonce).status_code == 400
+    assert exchange(client, attacker_code, "a" * 64).status_code == 400  # consommé : plus d'essai
+
+    attacker_code = login_code(client, provider, nonce="a" * 64)
+    assert exchange(client, attacker_code, nonce=None).status_code == 400  # onglet sans nonce
+    assert exchange(client, attacker_code, "a" * 64).status_code == 400
+
+
+def test_nonce_round_trip_happy_path(client, fake):
+    fake.identity("google", "3333", "gaby@example.com")
+    r = exchange(client, login_code(client, "google", nonce="Zx_-" * 11), nonce="Zx_-" * 11)
+    assert r.status_code == 200 and r.json()["user"]["email"] == "gaby@example.com"
 
 
 def test_state_cookie_is_not_a_session_token(client, fake):

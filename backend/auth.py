@@ -33,20 +33,27 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_token(user_id: int) -> str:
+def create_token(user: models.User) -> str:
     expires = datetime.now(timezone.utc) + timedelta(hours=settings.JWT_EXPIRE_HOURS)
-    return jwt.encode({"sub": str(user_id), "exp": expires}, settings.JWT_SECRET, algorithm="HS256")
+    # `ver` : jeton valable tant que le compte n'a pas révoqué ses sessions (token_version)
+    payload = {"sub": str(user.id), "ver": user.token_version or 0, "exp": expires}
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
 
 def user_from_token(db: Session, token: str | None) -> models.User | None:
+    """Compte du jeton (REST et WebSocket), ou None : jeton invalide, expiré ou révoqué."""
     if not token:
         return None
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=["HS256"])
         user_id = int(payload["sub"])
+        version = int(payload.get("ver", 0))  # jetons émis avant `ver` : version 0
     except (jwt.PyJWTError, KeyError, TypeError, ValueError):
         return None
-    return db.get(models.User, user_id)
+    user = db.get(models.User, user_id)
+    if user is None or version != user.token_version:
+        return None
+    return user
 
 
 def get_current_user(

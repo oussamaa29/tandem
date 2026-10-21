@@ -34,6 +34,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=True)
     color = Column(String(9), nullable=False)
     created_at = Column(DateTime, default=_utcnow)
+    # Recopié dans chaque jeton de session (`ver`) : l'incrémenter ferme toutes les sessions ouvertes
+    token_version = Column(Integer, nullable=False, default=0, server_default="0")
 
 
 class OAuthAccount(Base):
@@ -56,12 +58,17 @@ class OAuthAccount(Base):
 class LoginCode(Base):
     """Code de connexion à usage unique et de courte durée, remis au frontend dans l'URL de retour
     OAuth à la place du jeton de session. En base (et non en mémoire) : l'échange peut arriver
-    sur une autre instance que le retour OAuth. Seul son condensé est stocké."""
+    sur une autre instance que le retour OAuth. Seul son condensé est stocké.
+
+    Lié au navigateur qui a lancé la connexion par un nonce (gardé en sessionStorage, transmis à
+    /start puis exigé à l'échange) : un code obtenu par quelqu'un d'autre ne peut pas être utilisé
+    pour connecter un tiers à son compte (« login CSRF »)."""
 
     __tablename__ = "login_codes"
 
     id = Column(Integer, primary_key=True)
     code_hash = Column(String(64), nullable=False, unique=True, index=True)
+    nonce_hash = Column(String(64), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     expires_at = Column(DateTime, nullable=False)
 
