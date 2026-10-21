@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, session, setUnauthorizedHandler } from "./api";
+import { api, isOAuthProvider, session, setUnauthorizedHandler } from "./api";
 import { navigate, useHashRoute } from "./router";
 import type { User } from "./types";
 import AuthScreen from "./components/AuthScreen";
+import OAuthReturn from "./components/OAuthReturn";
 import BoardsHome from "./components/BoardsHome";
 import BoardView from "./components/BoardView";
 import { Icon, Logo } from "./components/ui";
@@ -10,9 +11,16 @@ import { useToast } from "./toast";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [checking, setChecking] = useState(() => Boolean(session.get()));
+  // Ouverture sur le retour OAuth : la session à venir remplace l'ancienne, inutile de la vérifier
+  const [checking, setChecking] = useState(() => Boolean(session.get()) && !window.location.hash.startsWith("#/auth/"));
   const route = useHashRoute();
   const toast = useToast();
+
+  const onAuth = useCallback((token: string, u: User) => {
+    session.set(token);
+    setUser(u);
+    setChecking(false);
+  }, []);
 
   const logout = useCallback(() => {
     session.clear();
@@ -28,7 +36,7 @@ export default function App() {
   }, [toast]);
 
   useEffect(() => {
-    if (!session.get()) return;
+    if (!session.get() || window.location.hash.startsWith("#/auth/")) return;
     api
       .me()
       .then(setUser)
@@ -36,19 +44,15 @@ export default function App() {
       .finally(() => setChecking(false));
   }, []);
 
-  if (checking) return null;
-  if (!user) {
-    return (
-      <AuthScreen
-        onAuth={(token, u) => {
-          session.set(token);
-          setUser(u);
-        }}
-      />
-    );
+  const [section, id] = route;
+  // Retour de Google / GitHub : prioritaire, même si une ancienne session existe
+  if (section === "auth" && isOAuthProvider(id)) {
+    return <OAuthReturn provider={id} onAuth={onAuth} />;
   }
 
-  const [section, id] = route;
+  if (checking) return null;
+  if (!user) return <AuthScreen onAuth={onAuth} />;
+
   const boardId = section === "b" && id ? Number(id) : null;
 
   return (

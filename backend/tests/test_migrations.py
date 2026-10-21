@@ -61,6 +61,22 @@ def test_downgrade_removes_everything_and_upgrade_is_repeatable(empty_db):
     assert set(Base.metadata.tables) <= set(inspect(engine).get_table_names())
 
 
+def test_downgrade_of_0002_keeps_passwordless_accounts(empty_db):
+    """Revenir avant la connexion Google / GitHub : les comptes sans mot de passe sont conservés
+    (condensé vide, refusé par verify_password) et la colonne redevient obligatoire."""
+    cfg = alembic_config()
+    command.upgrade(cfg, "head")
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO users (email, name, password_hash, color) VALUES "
+                          "('g@example.com', 'G', NULL, '#000'), ('p@example.com', 'P', 'h', '#000')"))
+        conn.execute(text("INSERT INTO oauth_accounts (provider, subject, user_id) VALUES ('google', 's', 1)"))
+    command.downgrade(cfg, "0001")
+    engine.dispose()
+    assert _rows("users") and [r[3] for r in _rows("users")] == ["", "h"]
+    assert not [c for c in inspect(engine).get_columns("users") if c["name"] == "password_hash"][0]["nullable"]
+    assert "oauth_accounts" not in inspect(engine).get_table_names()
+
+
 # Schéma exact produit par l'ancien create_all (avant Alembic et la convention de nommage) :
 # contraintes sans nom. Figé ici, car les modèles actuels ne savent plus le produire.
 LEGACY_SQLITE_SCHEMA = """
@@ -118,9 +134,10 @@ INSERT INTO activities VALUES (1, 1, 1, 'a créé le tableau', '2026-01-01 10:00
 """
 
 
-def _rows(table):
+def _rows(table, columns=None):
+    selected = ", ".join(f'"{c}"' for c in columns) if columns else "*"
     with engine.connect() as conn:
-        return [tuple(r) for r in conn.execute(text(f'SELECT * FROM "{table}" ORDER BY id'))]
+        return [tuple(r) for r in conn.execute(text(f'SELECT {selected} FROM "{table}" ORDER BY id'))]
 
 
 @pytest.mark.skipif(not is_sqlite, reason="seules des bases SQLite locales ont été créées par create_all")
@@ -134,7 +151,9 @@ def test_database_created_before_alembic_is_upgraded_in_place(empty_db):
     finally:
         raw.close()
     engine.dispose()
-    before = {t: _rows(t) for t in Base.metadata.tables}
+    # Schéma 0001 : sans les tables ni les colonnes ajoutées depuis, comparées à part
+    legacy = {t: [c["name"] for c in inspect(engine).get_columns(t)] for t in inspect(engine).get_table_names()}
+    before = {t: _rows(t, columns) for t, columns in legacy.items()}
     assert inspect(engine).get_unique_constraints("memberships")[0]["name"] is None
 
     upgrade_schema()
@@ -145,7 +164,8 @@ def test_database_created_before_alembic_is_upgraded_in_place(empty_db):
         assert MigrationContext.configure(conn).get_current_revision() == head
         assert compare_metadata(MigrationContext.configure(conn, opts={"compare_type": True}), Base.metadata) == []
         assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
-    assert {t: _rows(t) for t in Base.metadata.tables} == before
+    assert {t: _rows(t, columns) for t, columns in legacy.items()} == before
+    assert [r[0] for r in _rows("users", ["token_version"])] == [0, 0]
 
     insp = inspect(engine)
     for table in Base.metadata.sorted_tables:

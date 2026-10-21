@@ -179,6 +179,20 @@ textarea.input { height: auto; min-height: 120px; padding: 10px; resize: vertica
   .auth-aside { display: none; }
 }
 
+/* ---------- Connexion avec Google / GitHub ---------- */
+a.btn { text-decoration: none; }
+.oauth-buttons { display: flex; flex-direction: column; gap: 10px; }
+.oauth-mark { flex: none; width: 16px; height: 16px; display: inline-grid; place-items: center; font-weight: 700; font-size: 15px; line-height: 1; }
+.divider {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--mono); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3);
+}
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.oauth-return { min-height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 28px; padding: 32px 16px; }
+.oauth-return-box { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+.oauth-return-wait { display: flex; flex-direction: column; align-items: center; gap: 12px; font-family: var(--mono); font-size: 12.5px; color: var(--text-2); }
+.oauth-return-bar { display: block; width: 160px; height: 4px; }
+
 /* ---------- Barre supérieure ---------- */
 .app { display: flex; flex-direction: column; height: 100%; }
 .topbar {
