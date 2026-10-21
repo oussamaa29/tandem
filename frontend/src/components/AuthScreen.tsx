@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, OAUTH_LABELS, OAUTH_PROVIDERS, oauthStartUrl, type OAuthProvider } from "../api";
+import { api, OAUTH_LABELS, OAUTH_PROVIDERS, startOAuth, type OAuthProvider } from "../api";
 import { hashParams, replaceHash } from "../router";
 import type { User } from "../types";
 import { Logo } from "./ui";
@@ -100,10 +100,18 @@ export default function AuthScreen({ onAuth }: { onAuth: (token: string, user: U
             <>
               <div className="oauth-buttons">
                 {providers.map((p) => (
-                  <a key={p} className="btn btn-lg btn-block" href={oauthStartUrl(p)}>
+                  <button
+                    key={p}
+                    type="button"
+                    className="btn btn-lg btn-block"
+                    onClick={() => {
+                      if (!startOAuth(p)) setError("Ton navigateur bloque le stockage nécessaire à la connexion avec " +
+                        `${OAUTH_LABELS[p]} (navigation privée stricte ?). Utilise l'e-mail et le mot de passe.`);
+                    }}
+                  >
                     <ProviderMark provider={p} />
                     Continuer avec {OAUTH_LABELS[p]}
-                  </a>
+                  </button>
                 ))}
               </div>
               <div className="divider" role="separator">

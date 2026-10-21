@@ -8,8 +8,36 @@ export type OAuthProvider = (typeof OAUTH_PROVIDERS)[number];
 export const OAUTH_LABELS: Record<OAuthProvider, string> = { google: "Google", github: "GitHub" };
 export const isOAuthProvider = (value: string | undefined): value is OAuthProvider =>
   (OAUTH_PROVIDERS as readonly string[]).includes(value ?? "");
-/** Départ du parcours OAuth : simple lien, le serveur redirige vers le fournisseur. */
-export const oauthStartUrl = (provider: OAuthProvider) => `${API_BASE}/api/auth/${provider}/start`;
+
+const OAUTH_NONCE_KEY = "tandem.oauth-nonce";
+
+/** Lance « Continuer avec … » : tire un nonce de 256 bits, le garde dans CET onglet (sessionStorage)
+ * et le confie au serveur, qui exigera le même à l'échange du code de retour. Un code de connexion
+ * obtenu ailleurs (lien envoyé par un tiers) est ainsi inutilisable ici. Renvoie false si le
+ * stockage est bloqué (la connexion ne pourrait pas aboutir). */
+export function startOAuth(provider: OAuthProvider): boolean {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const nonce = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  try {
+    sessionStorage.setItem(OAUTH_NONCE_KEY, nonce);
+  } catch {
+    return false;
+  }
+  window.location.assign(`${API_BASE}/api/auth/${provider}/start?nonce=${nonce}`);
+  return true;
+}
+
+/** Nonce de l'onglet, lu une seule fois (retiré aussitôt). */
+export function takeOAuthNonce(): string | null {
+  try {
+    const nonce = sessionStorage.getItem(OAUTH_NONCE_KEY);
+    sessionStorage.removeItem(OAUTH_NONCE_KEY);
+    return nonce;
+  } catch {
+    return null;
+  }
+}
 
 export const session = {
   get: (): string | null => {
@@ -85,6 +113,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json();
 }
 
+/** Compte de la session enregistrée, ou null (absente, expirée, révoquée, serveur injoignable).
+ * Sans effet de bord, contrairement à api.me() : ni effacement de session ni « session expirée ». */
+export async function storedSessionUser(): Promise<User | null> {
+  const token = session.get();
+  if (!token) return null;
+  try {
+    const res = await fetch(`${API_BASE}/api/me`, { headers: { Authorization: `Bearer ${token}` } });
+    return res.ok ? ((await res.json()) as User) : null;
+  } catch {
+    return null;
+  }
+}
+
 function humanizeValidation(err: { loc?: string[]; msg?: string } | undefined): string {
   const field = err?.loc?.at(-1);
   const labels: Record<string, string> = { email: "E-mail", password: "Mot de passe", name: "Nom", title: "Titre" };
@@ -103,8 +144,9 @@ export const api = {
     request<{ token: string; user: User }>("/api/auth/login", json("POST", { email, password })),
   me: () => request<User>("/api/me"),
   providers: () => request<Record<OAuthProvider, boolean>>("/api/auth/providers"),
-  /** Code à usage unique reçu au retour de Google / GitHub → session. */
-  exchange: (code: string) => request<{ token: string; user: User }>("/api/auth/exchange", json("POST", { code })),
+  /** Code à usage unique reçu au retour de Google / GitHub + nonce de l'onglet → session. */
+  exchange: (code: string, nonce: string | null) =>
+    request<{ token: string; user: User }>("/api/auth/exchange", json("POST", { code, nonce })),
 
   listBoards: () => request<BoardSummary[]>("/api/boards"),
   createBoard: (name: string) => request<{ id: number; name: string }>("/api/boards", json("POST", { name })),
