@@ -1,11 +1,11 @@
 import threading
 
+from conftest import add_card
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
-import main
-from conftest import add_card
 from database import engine
+from routers import cards as cards_routes
 
 
 def titles(client, account, board_id):
@@ -79,7 +79,7 @@ def test_optimistic_lock_is_atomic(client, alice, bob, shared_board, monkeypatch
     """Une écriture concurrente validée APRÈS notre lecture mais AVANT notre écriture doit aussi
     donner 409 : la vérification de version se fait dans l'UPDATE, pas seulement en Python."""
     card = add_card(client, alice, shared_board["columns"][0]["id"], "Spec")
-    original = main.card_for
+    original = cards_routes.card_for
 
     def card_for_then_concurrent_edit(db, user, card_id):
         result = original(db, user, card_id)
@@ -90,11 +90,11 @@ def test_optimistic_lock_is_atomic(client, alice, bob, shared_board, monkeypatch
                          {"id": card_id})
         return result
 
-    monkeypatch.setattr(main, "card_for", card_for_then_concurrent_edit)
+    monkeypatch.setattr(cards_routes, "card_for", card_for_then_concurrent_edit)
     r = client.patch(f"/api/cards/{card['id']}", json={"version": 1, "description": "Version d'Alice"}, headers=alice.h)
     assert r.status_code == 409
     assert r.json()["detail"]["card"]["description"] == "Version de Bob"
-    monkeypatch.setattr(main, "card_for", original)
+    monkeypatch.setattr(cards_routes, "card_for", original)
     assert titles(client, alice, shared_board["id"])[0] == ["Spec"]
     fresh = client.get(f"/api/boards/{shared_board['id']}", headers=alice.h).json()["columns"][0]["cards"][0]
     assert (fresh["description"], fresh["version"]) == ("Version de Bob", 2)
@@ -104,7 +104,7 @@ def test_concurrent_edits_with_same_version_one_wins(client, alice, bob, shared_
     """Deux requêtes réellement simultanées avec la même version : une seule est acceptée."""
     card = add_card(client, alice, shared_board["columns"][0]["id"], "Spec")
     barrier = threading.Barrier(2)
-    original = main.card_for
+    original = cards_routes.card_for
 
     def synchronized_card_for(db, user, card_id):
         result = original(db, user, card_id)
@@ -112,7 +112,7 @@ def test_concurrent_edits_with_same_version_one_wins(client, alice, bob, shared_
         barrier.wait(timeout=5)  # les deux requêtes ont lu la version 1 avant d'écrire
         return result
 
-    monkeypatch.setattr(main, "card_for", synchronized_card_for)
+    monkeypatch.setattr(cards_routes, "card_for", synchronized_card_for)
     statuses = {}
 
     def edit(account, text_):
