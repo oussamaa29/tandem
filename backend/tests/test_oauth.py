@@ -7,12 +7,12 @@ from urllib.parse import parse_qs, urlsplit
 
 import jwt
 import pytest
+from conftest import receive_until
 from cryptography.hazmat.primitives.asymmetric import rsa
 from starlette.websockets import WebSocketDisconnect
 
 import oauth
 from config import settings
-from conftest import receive_until
 
 GOOGLE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)

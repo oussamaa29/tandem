@@ -3,9 +3,9 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from conftest import drop_schema
 from sqlalchemy import inspect, text
 
-from conftest import drop_schema
 from database import Base, alembic_config, engine, is_sqlite, normalize_url, upgrade_schema
 
 

@@ -1,12 +1,13 @@
 from contextlib import contextmanager
 
 import pytest
+from conftest import add_card, receive_until
 from starlette.websockets import WebSocketDisconnect
 
 import main
 import models
-from conftest import add_card, receive_until
 from database import SessionLocal
+from routers import realtime as realtime_routes
 
 
 @contextmanager
@@ -40,7 +41,7 @@ def test_rejects_missing_token_and_non_members(client, alice, bob, board):
 
 
 def test_auth_times_out_and_token_in_url_is_ignored(client, alice, board, monkeypatch):
-    monkeypatch.setattr(main, "WS_AUTH_TIMEOUT", 0.2)
+    monkeypatch.setattr(realtime_routes, "WS_AUTH_TIMEOUT", 0.2)
     # Le jeton en query string n'est plus lu : il finirait dans les journaux d'accès
     with client.websocket_connect(f"/ws/boards/{board['id']}?token={alice.token}") as ws:
         assert close_code(ws) == 4401

@@ -3,12 +3,14 @@ import time
 from contextlib import contextmanager
 
 import pytest
+from conftest import add_card
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
-import main
-from conftest import add_card
 from database import engine, is_sqlite
+from routers import boards as boards_routes
+from routers import cards as cards_routes
+from routers import columns as columns_routes
 
 
 @contextmanager
@@ -92,7 +94,7 @@ def test_invite_into_board_deleted_concurrently_is_404(client, alice, bob, board
     """Clé étrangère violée (tableau supprimé entre la vérification et l'insertion) : 404, et non
     le 409 « fait déjà partie du tableau ». En Postgres lock_board empêche cette course ; on le
     neutralise pour tester le cas SQLite, où il ne verrouille rien."""
-    monkeypatch.setattr(main, "lock_board", lambda db, board_id: None)
+    monkeypatch.setattr(boards_routes, "lock_board", lambda db, board_id: None)
     with before_first_flush("DELETE FROM boards WHERE id = :b", {"b": board["id"]}) as fired:
         r = client.post(f"/api/boards/{board['id']}/members", json={"email": "bob@example.com"}, headers=alice.h)
     assert fired
@@ -100,7 +102,7 @@ def test_invite_into_board_deleted_concurrently_is_404(client, alice, bob, board
 
 
 def test_write_on_board_deleted_before_lock_is_404(client, alice, board, monkeypatch):
-    original = main.board_for
+    original = columns_routes.board_for
 
     def board_for_then_deleted(db, user, board_id, owner_only=False):
         result = original(db, user, board_id, owner_only)
@@ -108,7 +110,7 @@ def test_write_on_board_deleted_before_lock_is_404(client, alice, board, monkeyp
             conn.execute(text("DELETE FROM boards WHERE id = :b"), {"b": board_id})
         return result
 
-    monkeypatch.setattr(main, "board_for", board_for_then_deleted)
+    monkeypatch.setattr(columns_routes, "board_for", board_for_then_deleted)
     r = client.post(f"/api/boards/{board['id']}/columns", json={"name": "Revue"}, headers=alice.h)
     assert r.status_code == 404
 
@@ -120,14 +122,14 @@ def test_deleting_board_during_card_edit_does_not_deadlock(client, alice, board,
     tableau et attendait la carte (ON DELETE CASCADE) → interblocage détecté par Postgres, 500."""
     card = add_card(client, alice, board["columns"][0]["id"], "Spec")
     card_written = threading.Event()
-    original_emit = main.emit
+    original_emit = cards_routes.emit
 
     def slow_emit(*args, **kwargs):
         card_written.set()  # carte modifiée, transaction encore ouverte
         time.sleep(0.5)  # laisse à la suppression le temps d'arriver sur ses verrous
         return original_emit(*args, **kwargs)
 
-    monkeypatch.setattr(main, "emit", slow_emit)
+    monkeypatch.setattr(cards_routes, "emit", slow_emit)
     statuses = {}
 
     def edit():
